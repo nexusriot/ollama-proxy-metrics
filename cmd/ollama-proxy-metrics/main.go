@@ -160,10 +160,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if payload.Stream != nil {
 		stream = *payload.Stream
 	}
-	streamLabel := "true"
-	if !stream {
-		streamLabel = "false"
-	}
+	streamLabel := strconv.FormatBool(stream)
 
 	bytesIn.WithLabelValues(endpoint, model, streamLabel).Add(float64(len(bodyBuf)))
 
@@ -191,7 +188,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := httpClient.Do(upReq)
 	if err != nil {
-		log.Printf("upstream error: %v", err)
+		log.Printf("[ERROR] upstream error: %v", err)
 		statusCode := http.StatusBadGateway
 		statusLabel := strconv.Itoa(statusCode)
 
@@ -205,7 +202,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	statusLabel := strconv.Itoa(resp.StatusCode)
 
-	// Copy upstream headers to client (simple version, no hop-by-hop stripping).
 	for k, vals := range resp.Header {
 		for _, v := range vals {
 			w.Header().Add(k, v)
@@ -214,42 +210,41 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	if !stream {
-		// Non-streaming: buffer entire response body, parse metrics, then write out.
 		respBuf, err := io.ReadAll(resp.Body)
 		if err != nil {
-			log.Printf("failed to read upstream response body: %v", err)
+			log.Printf("[ERROR] reading non-stream response: %v", err)
 			return
 		}
 
 		bytesOut.WithLabelValues(endpoint, model, streamLabel).Add(float64(len(respBuf)))
 
-		// Try to parse token metrics.
+		// Token metrics
 		var m OllamaResponseMetrics
-		if err := json.Unmarshal(respBuf, &m); err == nil {
-			if m.PromptEvalCount != nil {
-				tokensIn.WithLabelValues(endpoint, model).Add(float64(*m.PromptEvalCount))
-			}
-			if m.EvalCount != nil {
-				tokensOut.WithLabelValues(endpoint, model).Add(float64(*m.EvalCount))
-			}
+		_ = json.Unmarshal(respBuf, &m)
+		if m.PromptEvalCount != nil {
+			tokensIn.WithLabelValues(endpoint, model).Add(float64(*m.PromptEvalCount))
+		}
+		if m.EvalCount != nil {
+			tokensOut.WithLabelValues(endpoint, model).Add(float64(*m.EvalCount))
 		}
 
-		if _, err := w.Write(respBuf); err != nil {
-			log.Printf("failed to write response body to client: %v", err)
-		}
+		_, _ = w.Write(respBuf)
 
-		// Timing after full body processed.
 		duration := time.Since(start).Seconds()
 		reqTotal.WithLabelValues(endpoint, model, statusLabel, streamLabel).Inc()
 		reqDuration.WithLabelValues(endpoint, model, streamLabel).Observe(duration)
 
+		log.Printf(
+			"[REQ] %s %s model=%s stream=%s status=%d duration=%.3fs bytes_in=%d bytes_out=%d",
+			r.Method, endpoint, model, streamLabel, resp.StatusCode, duration, len(bodyBuf), len(respBuf),
+		)
+
 		return
 	}
 
-	// Streaming mode: just pipe bytes through, we only track duration and size (no token stats).
 	n, err := io.Copy(w, resp.Body)
 	if err != nil {
-		log.Printf("streaming response to client failed: %v", err)
+		log.Printf("[ERROR] streaming response: %v", err)
 	}
 
 	bytesOut.WithLabelValues(endpoint, model, streamLabel).Add(float64(n))
@@ -257,4 +252,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	duration := time.Since(start).Seconds()
 	reqTotal.WithLabelValues(endpoint, model, statusLabel, streamLabel).Inc()
 	reqDuration.WithLabelValues(endpoint, model, streamLabel).Observe(duration)
+
+	log.Printf(
+		"[REQ] %s %s model=%s stream=%s status=%d duration=%.3fs bytes_in=%d bytes_out=%d",
+		r.Method, endpoint, model, streamLabel, resp.StatusCode, duration, len(bodyBuf), n,
+	)
 }
