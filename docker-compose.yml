@@ -1,0 +1,66 @@
+services:
+
+#  ollama:
+#    image: ollama/ollama:latest
+#    ports:
+#      - "${OLLAMA_PORT:-11434}:11434"
+#    volumes:
+#      - ollama-models:/root/.ollama
+#    restart: unless-stopped
+#    # Uncomment for GPU support:
+#    # deploy:
+#    #   resources:
+#    #     reservations:
+#    #       devices:
+#    #         - driver: nvidia
+#    #           count: all
+#    #           capabilities: [gpu]
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${PROXY_PORT:-8080}:8080"
+    environment:
+      OLLAMA_UPSTREAM: "${OLLAMA_UPSTREAM:-http://ollama:11434}"
+      DB_PATH:         "${DB_PATH:-/data/db.sqlite}"
+      LOG_PATH:        "${LOG_PATH:-/data/logs/proxy.log}"
+      LISTEN_ADDR:     "${LISTEN_ADDR:-:8080}"
+    volumes:
+      - ./data:/data              # persistent SQLite DB + logs
+#    depends_on:
+#      - ollama
+    restart: unless-stopped
+    healthcheck:
+      test:     ["CMD", "wget", "-qO-", "http://localhost:8080/metrics"]
+      interval: 15s
+      timeout:  5s
+      retries:  3
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      - proxy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - proxy
+    restart: unless-stopped
+    profiles:
+      - monitoring   # opt-in: docker compose --profile monitoring up
+
+volumes:
+  ollama-models:   # Ollama model files
+  prometheus-data: # Prometheus TSDB
