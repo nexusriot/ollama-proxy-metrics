@@ -24,16 +24,50 @@ import (
 
 // requestPayload is the minimal incoming JSON shape we care about.
 type requestPayload struct {
-	Model  string `json:"model"`
-	Stream *bool  `json:"stream,omitempty"`
+	Model    string        `json:"model"`
+	Stream   *bool         `json:"stream,omitempty"`
+	Prompt   string        `json:"prompt,omitempty"`   // /api/generate
+	Messages []chatMessage `json:"messages,omitempty"` // /api/chat
 }
 
-// ollamaChunk covers both final non-stream responses and the last streaming
-// chunk, both of which carry eval_count / prompt_eval_count.
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// ollamaChunk covers both final non-stream responses and every streaming chunk.
 type ollamaChunk struct {
-	Done            bool   `json:"done"`
-	EvalCount       *int64 `json:"eval_count,omitempty"`
-	PromptEvalCount *int64 `json:"prompt_eval_count,omitempty"`
+	Done            bool         `json:"done"`
+	Response        string       `json:"response,omitempty"`  // /api/generate
+	Message         *chatMessage `json:"message,omitempty"`   // /api/chat
+	EvalCount       *int64       `json:"eval_count,omitempty"`
+	PromptEvalCount *int64       `json:"prompt_eval_count,omitempty"`
+}
+
+// extractPromptText returns the user-facing prompt from the parsed request.
+// For /api/generate it uses the "prompt" field; for /api/chat it uses the
+// content of the last message with role "user".
+func extractPromptText(p requestPayload) string {
+	if p.Prompt != "" {
+		return p.Prompt
+	}
+	for i := len(p.Messages) - 1; i >= 0; i-- {
+		if p.Messages[i].Role == "user" {
+			return p.Messages[i].Content
+		}
+	}
+	return ""
+}
+
+// responseText returns the assistant's text from a parsed Ollama chunk/response.
+func responseText(c ollamaChunk) string {
+	if c.Response != "" {
+		return c.Response
+	}
+	if c.Message != nil {
+		return c.Message.Content
+	}
+	return ""
 }
 
 // Metrics bundles all Prometheus counters/histograms for the proxy.
@@ -131,6 +165,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var payload requestPayload
 	_ = json.Unmarshal(bodyBuf, &payload) // best-effort
 
+	promptText := extractPromptText(payload)
 	model := payload.Model
 	if model == "" {
 		model = "unknown"
@@ -191,8 +226,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var promptTokens, completionTokens int64
+		var respText string
 		var chunk ollamaChunk
 		if json.Unmarshal(respBuf, &chunk) == nil {
+			respText = responseText(chunk)
 			if chunk.PromptEvalCount != nil {
 				promptTokens = *chunk.PromptEvalCount
 				h.metrics.TokensIn.WithLabelValues(endpoint, model).Add(float64(promptTokens))
@@ -228,6 +265,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ErrorMessage:     errMsg,
 			ClientIP:         clientIP,
 			UserAgent:        r.UserAgent(),
+			PromptText:       promptText,
+			ResponseText:     respText,
 		}
 		h.persistAndLog(rec)
 		return
@@ -242,6 +281,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var totalBytes int64
 	var promptTokens, completionTokens int64
+	var respBuilder strings.Builder
 	errMsg := ""
 
 	for scanner.Scan() {
@@ -258,14 +298,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 
-		// Parse every chunk looking for the final one (done=true).
+		// Accumulate response text and token counts from every chunk.
 		var chunk ollamaChunk
-		if json.Unmarshal(line, &chunk) == nil && chunk.Done {
-			if chunk.PromptEvalCount != nil {
-				promptTokens = *chunk.PromptEvalCount
-			}
-			if chunk.EvalCount != nil {
-				completionTokens = *chunk.EvalCount
+		if json.Unmarshal(line, &chunk) == nil {
+			respBuilder.WriteString(responseText(chunk))
+			if chunk.Done {
+				if chunk.PromptEvalCount != nil {
+					promptTokens = *chunk.PromptEvalCount
+				}
+				if chunk.EvalCount != nil {
+					completionTokens = *chunk.EvalCount
+				}
 			}
 		}
 	}
@@ -303,6 +346,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ErrorMessage:     errMsg,
 		ClientIP:         clientIP,
 		UserAgent:        r.UserAgent(),
+		PromptText:       promptText,
+		ResponseText:     respBuilder.String(),
 	}
 	h.persistAndLog(rec)
 }

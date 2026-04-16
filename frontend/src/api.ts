@@ -30,6 +30,8 @@ export interface RequestRow {
   error_message: string
   client_ip: string
   user_agent: string
+  prompt_text: string
+  response_text: string
 }
 
 export interface RequestsResponse {
@@ -66,8 +68,15 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
+async function post<T>(path: string): Promise<T> {
+  const res = await fetch(BASE + path, { method: 'POST' })
+  if (!res.ok) throw new Error(`API ${path}: ${res.status} ${res.statusText}`)
+  return res.json() as Promise<T>
+}
+
 export const api = {
   summary: () => get<Summary>('/summary'),
+  cleanup: () => post<{ status: string }>('/cleanup'),
   requests: (params: { limit?: number; offset?: number; model?: string; session?: string }) => {
     const q = new URLSearchParams()
     if (params.limit)   q.set('limit',   String(params.limit))
