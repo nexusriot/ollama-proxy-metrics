@@ -281,3 +281,62 @@ func TestResponseContentType(t *testing.T) {
 		t.Errorf("expected application/json, got %q", ct)
 	}
 }
+
+func TestHandleCleanup_DeletesAllRows(t *testing.T) {
+	store := openTestDB(t)
+	insertSample(t, store, "r1", "llama3", "s1", 10, 20)
+	insertSample(t, store, "r2", "llama3", "s2", 5, 15)
+	mux := newTestMux(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/cleanup", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// All rows must be gone.
+	_, total, err := store.ListRequests(100, 0, "", "")
+	if err != nil {
+		t.Fatalf("ListRequests after cleanup: %v", err)
+	}
+	if total != 0 {
+		t.Errorf("expected 0 rows after cleanup, got %d", total)
+	}
+}
+
+func TestHandleCleanup_SummaryReturnsZeroAfterCleanup(t *testing.T) {
+	store := openTestDB(t)
+	insertSample(t, store, "r1", "llama3", "s1", 100, 200)
+	mux := newTestMux(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/cleanup", nil)
+	httptest.NewRecorder() // discard
+	mux.ServeHTTP(httptest.NewRecorder(), req)
+
+	rr := get(t, mux, "/admin/api/summary")
+	var sum map[string]interface{}
+	_ = json.NewDecoder(rr.Body).Decode(&sum)
+	if sum["total_requests"].(float64) != 0 {
+		t.Errorf("expected total_requests=0 after cleanup, got %v", sum["total_requests"])
+	}
+}
+
+func TestHandleCleanup_MethodNotAllowed(t *testing.T) {
+	mux := newTestMux(t, openTestDB(t))
+	rr := get(t, mux, "/admin/api/cleanup") // GET instead of POST
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rr.Code)
+	}
+}
+
+func TestHandleCleanup_IdempotentOnEmptyDB(t *testing.T) {
+	mux := newTestMux(t, openTestDB(t))
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/cleanup", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 on empty DB, got %d", rr.Code)
+	}
+}

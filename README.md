@@ -11,7 +11,7 @@ A lightweight **Go reverse proxy** for Ollama that adds:
 ## Architecture
 
 ```
-┌──────────────┐    /api/*     ┌──────────────────────┐    ┌────────────────┐
+┌──────────────┐    /api/*    ┌──────────────────────┐    ┌────────────────┐
 │  Client App  │ ──────────▶  │  ollama-proxy (Go)   │ ──▶│  Ollama :11434 │
 │  (curl / UI) │              │  :8080               │    └────────────────┘
 └──────────────┘              │                      │
@@ -21,8 +21,8 @@ A lightweight **Go reverse proxy** for Ollama that adds:
                               └──────────────────────┘
                                         ▲
                               ┌─────────┴────────┐
-                              │  frontend (nginx) │
-                              │  :3000            │
+                              │  frontend (nginx)│
+                              │  :3000           │
                               └──────────────────┘
 ```
 

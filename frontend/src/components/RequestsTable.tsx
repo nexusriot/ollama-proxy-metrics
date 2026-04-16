@@ -130,19 +130,43 @@ export function RequestsTable({
                     </td>
                   </tr>
                   {expandedId === r.id && (
-                    <tr key={`${r.id}-detail`} style={{ background: 'rgba(99,102,241,.05)' }}>
-                      <td colSpan={9} style={{ padding: '12px 16px' }}>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8, fontSize: 12 }}>
-                          <div><span style={{ color: 'var(--muted)' }}>Request ID: </span><span className="mono">{r.request_id}</span></div>
-                          <div><span style={{ color: 'var(--muted)' }}>Client IP: </span>{r.client_ip}</div>
-                          <div><span style={{ color: 'var(--muted)' }}>Method: </span>{r.method}</div>
-                          <div style={{ gridColumn: '1 / -1' }}><span style={{ color: 'var(--muted)' }}>User-Agent: </span>{r.user_agent || '—'}</div>
+                    <tr key={`${r.id}-detail`} style={{ background: 'rgba(99,102,241,.04)' }}>
+                      <td colSpan={9} style={{ padding: '16px 18px' }}>
+
+                        {/* prompt / response */}
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+                          <div>
+                            <div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '.07em', color: 'var(--muted)', marginBottom: 6 }}>
+                              Prompt
+                            </div>
+                            <pre className="detail-text">
+                              {r.prompt_text || <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>— not captured —</span>}
+                            </pre>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '.07em', color: 'var(--muted)', marginBottom: 6 }}>
+                              Response
+                            </div>
+                            <pre className="detail-text">
+                              {r.response_text || <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>— not captured —</span>}
+                            </pre>
+                          </div>
+                        </div>
+
+                        {/* metadata row */}
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 6, fontSize: 12, borderTop: '1px solid var(--border)', paddingTop: 10 }}>
+                          <div><span style={{ color: 'var(--muted)' }}>Request ID </span><span className="mono" style={{ fontSize: 11 }}>{r.request_id}</span></div>
+                          <div><span style={{ color: 'var(--muted)' }}>Client IP </span>{r.client_ip || '—'}</div>
+                          <div><span style={{ color: 'var(--muted)' }}>Method </span>{r.method}</div>
+                          <div><span style={{ color: 'var(--muted)' }}>Session </span><span className="mono" style={{ fontSize: 11 }}>{r.session_id || '—'}</span></div>
+                          <div style={{ gridColumn: '1 / -1' }}><span style={{ color: 'var(--muted)' }}>User-Agent </span>{r.user_agent || '—'}</div>
                           {r.error_message && (
                             <div style={{ gridColumn: '1 / -1', color: 'var(--red)' }}>
-                              Error: {r.error_message}
+                              ⚠ {r.error_message}
                             </div>
                           )}
                         </div>
+
                       </td>
                     </tr>
                   )}

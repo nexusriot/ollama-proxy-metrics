@@ -26,13 +26,14 @@ func (h *Handler) Register(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc(prefix+"/daily", corsMiddleware(h.handleDaily))
 	mux.HandleFunc(prefix+"/sessions", corsMiddleware(h.handleSessions))
 	mux.HandleFunc(prefix+"/models", corsMiddleware(h.handleModels))
+	mux.HandleFunc(prefix+"/cleanup", corsMiddleware(h.handleCleanup))
 }
 
 // corsMiddleware adds CORS headers to support the React dev-server.
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -156,6 +157,18 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, models)
+}
+
+func (h *Handler) handleCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if err := h.store.DeleteAll(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func queryInt(s string, def int) int {

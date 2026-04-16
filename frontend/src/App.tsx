@@ -69,6 +69,22 @@ export default function App() {
     catch { /* non-critical */ }
   }, [])
 
+  const [cleaning, setCleaning] = useState(false)
+
+  async function handleCleanup() {
+    if (!window.confirm('Delete ALL recorded statistics? This cannot be undone.')) return
+    setCleaning(true)
+    setError(null)
+    try {
+      await api.cleanup()
+      refreshAll()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setCleaning(false)
+    }
+  }
+
   const refreshAll = useCallback(() => {
     refreshRef.current++
     setError(null)
@@ -116,6 +132,14 @@ export default function App() {
         </nav>
         <button className="refresh-btn" onClick={refreshAll} title="Refresh data">
           ↻ Refresh
+        </button>
+        <button
+          className="cleanup-btn"
+          onClick={handleCleanup}
+          disabled={cleaning}
+          title="Delete all statistics"
+        >
+          {cleaning ? 'Clearing…' : '🗑 Clear stats'}
         </button>
       </header>
 

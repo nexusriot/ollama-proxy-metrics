@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS requests (
     total_tokens      BIGINT  NOT NULL DEFAULT 0,
     error_message     TEXT    NOT NULL DEFAULT '',
     client_ip         TEXT    NOT NULL DEFAULT '',
-    user_agent        TEXT    NOT NULL DEFAULT ''
+    user_agent        TEXT    NOT NULL DEFAULT '',
+    prompt_text       TEXT    NOT NULL DEFAULT '',
+    response_text     TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp  ON requests(timestamp);
@@ -56,6 +58,13 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
+	// SQLite returns "duplicate column name" when a column already exists – that's fine.
+	for _, col := range []string{
+		`ALTER TABLE requests ADD COLUMN prompt_text   TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN response_text TEXT NOT NULL DEFAULT ''`,
+	} {
+		_, _ = db.Exec(col)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -81,6 +90,8 @@ type RequestRecord struct {
 	ErrorMessage     string
 	ClientIP         string
 	UserAgent        string
+	PromptText       string
+	ResponseText     string
 }
 
 // InsertRequest persists a RequestRecord.
@@ -90,8 +101,9 @@ func (s *Store) InsertRequest(r RequestRecord) error {
 			request_id, session_id, timestamp, endpoint, method, model, stream,
 			status_code, duration_ms, request_bytes, response_bytes,
 			prompt_tokens, completion_tokens, total_tokens,
-			error_message, client_ip, user_agent
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			error_message, client_ip, user_agent,
+			prompt_text, response_text
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.RequestID,
 		r.SessionID,
 		r.Timestamp.UTC().Format(time.RFC3339Nano),
@@ -109,6 +121,8 @@ func (s *Store) InsertRequest(r RequestRecord) error {
 		r.ErrorMessage,
 		r.ClientIP,
 		r.UserAgent,
+		r.PromptText,
+		r.ResponseText,
 	)
 	return err
 }
@@ -133,6 +147,8 @@ type RequestRow struct {
 	ErrorMessage     string    `json:"error_message"`
 	ClientIP         string    `json:"client_ip"`
 	UserAgent        string    `json:"user_agent"`
+	PromptText       string    `json:"prompt_text"`
+	ResponseText     string    `json:"response_text"`
 }
 
 // ListRequests returns paginated requests, newest first.
@@ -159,7 +175,8 @@ func (s *Store) ListRequests(limit, offset int, model, sessionID string) (rows [
 		SELECT id, request_id, session_id, timestamp, endpoint, method, model, stream,
 		       status_code, duration_ms, request_bytes, response_bytes,
 		       prompt_tokens, completion_tokens, total_tokens,
-		       error_message, client_ip, user_agent
+		       error_message, client_ip, user_agent,
+		       prompt_text, response_text
 		FROM requests WHERE ` + where + `
 		ORDER BY timestamp DESC
 		LIMIT ? OFFSET ?`
@@ -181,6 +198,7 @@ func (s *Store) ListRequests(limit, offset int, model, sessionID string) (rows [
 			&r.StatusCode, &r.DurationMS, &r.RequestBytes, &r.ResponseBytes,
 			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
 			&r.ErrorMessage, &r.ClientIP, &r.UserAgent,
+			&r.PromptText, &r.ResponseText,
 		); err != nil {
 			return nil, 0, err
 		}
@@ -361,6 +379,16 @@ func (s *Store) Models() ([]string, error) {
 		out = []string{}
 	}
 	return out, rows.Err()
+}
+
+// DeleteAll removes every row from the requests table and reclaims space.
+func (s *Store) DeleteAll() error {
+	_, err := s.db.Exec("DELETE FROM requests")
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec("VACUUM")
+	return err
 }
 
 func boolToInt(b bool) int {
