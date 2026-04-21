@@ -238,6 +238,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				completionTokens = *chunk.EvalCount
 				h.metrics.TokensOut.WithLabelValues(endpoint, model).Add(float64(completionTokens))
 			}
+		} else {
+			// Fallback: some Ollama versions return NDJSON even for stream=false.
+			sc := bufio.NewScanner(bytes.NewReader(respBuf))
+			for sc.Scan() {
+				var c ollamaChunk
+				if json.Unmarshal(sc.Bytes(), &c) != nil {
+					continue
+				}
+				respText += responseText(c)
+				if c.Done {
+					if c.PromptEvalCount != nil {
+						promptTokens = *c.PromptEvalCount
+					}
+					if c.EvalCount != nil {
+						completionTokens = *c.EvalCount
+					}
+				}
+			}
+			if promptTokens > 0 {
+				h.metrics.TokensIn.WithLabelValues(endpoint, model).Add(float64(promptTokens))
+			}
+			if completionTokens > 0 {
+				h.metrics.TokensOut.WithLabelValues(endpoint, model).Add(float64(completionTokens))
+			}
+			if promptTokens == 0 && completionTokens == 0 {
+				h.logger.Warn("could not extract token counts from non-stream response",
+					"request_id", reqID, "model", model, "response_bytes", len(respBuf))
+			}
 		}
 
 		_, _ = w.Write(respBuf)
