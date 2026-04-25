@@ -24,10 +24,11 @@ import (
 
 // requestPayload is the minimal incoming JSON shape we care about.
 type requestPayload struct {
-	Model    string        `json:"model"`
-	Stream   *bool         `json:"stream,omitempty"`
-	Prompt   string        `json:"prompt,omitempty"`   // /api/generate
-	Messages []chatMessage `json:"messages,omitempty"` // /api/chat
+	Model    string          `json:"model"`
+	Stream   *bool           `json:"stream,omitempty"`
+	Prompt   string          `json:"prompt,omitempty"`   // /api/generate
+	Messages []chatMessage   `json:"messages,omitempty"` // /api/chat
+	Input    json.RawMessage `json:"input,omitempty"`    // /api/embed: string or []string
 }
 
 type chatMessage struct {
@@ -46,10 +47,20 @@ type ollamaChunk struct {
 
 // extractPromptText returns the user-facing prompt from the parsed request.
 // For /api/generate it uses the "prompt" field; for /api/chat it uses the
-// content of the last message with role "user".
+// content of the last message with role "user"; for /api/embed it uses "input".
 func extractPromptText(p requestPayload) string {
 	if p.Prompt != "" {
 		return p.Prompt
+	}
+	if len(p.Input) > 0 {
+		var s string
+		if json.Unmarshal(p.Input, &s) == nil {
+			return s
+		}
+		var ss []string
+		if json.Unmarshal(p.Input, &ss) == nil {
+			return strings.Join(ss, " ")
+		}
 	}
 	for i := len(p.Messages) - 1; i >= 0; i-- {
 		if p.Messages[i].Role == "user" {
@@ -170,7 +181,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = "unknown"
 	}
-	stream := payload.Stream == nil || *payload.Stream // default: true
+	// /api/embed and /api/embeddings never stream; default to false for those.
+	isEmbedEndpoint := strings.HasSuffix(endpoint, "/api/embed") || strings.HasSuffix(endpoint, "/api/embeddings")
+	var stream bool
+	if isEmbedEndpoint {
+		stream = payload.Stream != nil && *payload.Stream
+	} else {
+		stream = payload.Stream == nil || *payload.Stream // default: true
+	}
 	streamLabel := strconv.FormatBool(stream)
 
 	h.metrics.BytesIn.WithLabelValues(endpoint, model, streamLabel).Add(float64(len(bodyBuf)))
@@ -238,9 +256,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				completionTokens = *chunk.EvalCount
 				h.metrics.TokensOut.WithLabelValues(endpoint, model).Add(float64(completionTokens))
 			}
+			if chunk.Done && chunk.PromptEvalCount == nil && chunk.EvalCount == nil {
+				h.logger.Warn("no token counts in response",
+					"request_id", reqID, "endpoint", endpoint, "model", model)
+			}
 		} else {
 			// Fallback: some Ollama versions return NDJSON even for stream=false.
 			sc := bufio.NewScanner(bytes.NewReader(respBuf))
+			var sawPrompt, sawCompletion bool
 			for sc.Scan() {
 				var c ollamaChunk
 				if json.Unmarshal(sc.Bytes(), &c) != nil {
@@ -250,21 +273,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if c.Done {
 					if c.PromptEvalCount != nil {
 						promptTokens = *c.PromptEvalCount
+						sawPrompt = true
 					}
 					if c.EvalCount != nil {
 						completionTokens = *c.EvalCount
+						sawCompletion = true
 					}
 				}
 			}
-			if promptTokens > 0 {
+			if sawPrompt {
 				h.metrics.TokensIn.WithLabelValues(endpoint, model).Add(float64(promptTokens))
 			}
-			if completionTokens > 0 {
+			if sawCompletion {
 				h.metrics.TokensOut.WithLabelValues(endpoint, model).Add(float64(completionTokens))
 			}
-			if promptTokens == 0 && completionTokens == 0 {
+			if !sawPrompt && !sawCompletion {
 				h.logger.Warn("could not extract token counts from non-stream response",
-					"request_id", reqID, "model", model, "response_bytes", len(respBuf))
+					"request_id", reqID, "endpoint", endpoint, "model", model, "response_bytes", len(respBuf))
 			}
 		}
 
