@@ -255,15 +255,22 @@ Vite + React + TypeScript + Recharts, no router and no state library:
   the pricing table once (for the currency symbol) and owns the live-tail state.
 - `components/` — presentational: `SummaryCards`, `DailyChart` (toggle
   tokens/requests/duration/**cost** × 7/14/30/90-day window), `RequestsTable`
-  (paginated, filterable, expandable rows with prompt/response + TTFT/throughput/cost,
-  plus **Live** and **CSV** controls), `ModelsTable` (per-model table + throughput
-  bar chart), `SessionsTable` (click-through pre-filters the Requests tab).
+  (paginated; filter by model/session/**free-text search**/**date range**;
+  expandable rows with prompt/response + **copy** buttons + TTFT/throughput/cost;
+  **Live** and **CSV** controls), `ModelsTable` (per-model table + throughput bar
+  chart), `SessionsTable` (click-through pre-filters the Requests tab).
 
-Data flow is **pull, on demand**: load on mount, re-fetch when filters/page/window
-change, and a manual refresh button — *except* the live tail, which is **push**:
-toggling **Live** opens an `EventSource` to `/admin/api/stream` and prepends rows
-as they arrive (capped at 200, pagination suspended). Closing the toggle (or
-leaving the tab) closes the stream and returns to paginated browse mode.
+Data flow is **pull, on demand**: load on mount, re-fetch when
+filters/search/dates/page/window change (each filter change resets to page 1),
+and a manual refresh button — *except* the live tail, which is **push**: toggling
+**Live** opens an `EventSource` to `/admin/api/stream` and prepends rows as they
+arrive (capped at 200, pagination suspended, still honoring the model/session/search
+filters client-side). The stream is gated on the Requests tab, so switching tabs
+pauses it and returning re-opens it. Search maps to the `q` param (case-insensitive
+substring over endpoint/model/session/prompt/response, LIKE-wildcards escaped) and
+the date pickers convert local time to UTC RFC3339 `since`/`until` bounds; both the
+requests list and CSV/JSON export share the same filter set. A 25s SSE heartbeat
+(`: ping`) keeps idle live connections alive through intermediaries.
 
 **Two ways to serve it:** in production the nginx image serves the static build
 and proxies `/admin/api`; in dev, `vite` proxies `/admin/api` → `:8080`. The Go
@@ -409,16 +416,18 @@ These remain the highest-value next steps and are deliberately **not** implement
 Go tests per package, all CGO-free and hermetic (every store opens `:memory:`):
 
 - `internal/db` — schema/insert (incl. duplicate-ID, int64 tokens), pagination +
-  model/session filtering, `ModelStats` (ordering + `unknown` exclusion), export
-  (filter + limit), and cost aggregation in the summary.
+  model/session filtering, **free-text `q` search (with LIKE-escaping) and
+  `since`/`until` date-range filtering**, `ModelStats` (ordering + `unknown`
+  exclusion), export (filter + limit), and cost aggregation in the summary.
 - `internal/proxy` — an `httptest` fake upstream exercises native non-stream and
   stream proxying, **OpenAI non-stream + SSE** parsing (usage + framing), token
   extraction, status recording, `502`, **multi-upstream failover**, **rate-limit
   `429`**, **cost recording**, `determineStream` defaults, session/IP resolution,
   the `model:"unknown"` default, and byte accounting.
 - `internal/api` — every handler via `httptest`: CORS/preflight, method guards,
-  cleanup, model-stats, CSV + JSON export, pricing, and the SSE stream (both the
-  503-without-broker path and live delivery against a real `httptest.Server`).
+  cleanup, model-stats, CSV + JSON export, pricing, **free-text search (`q`)**, and
+  the SSE stream (both the 503-without-broker path and live delivery against a real
+  `httptest.Server`).
 - `internal/pricing`, `internal/ratelimit`, `internal/events`, `internal/logging`
   — unit tests for cost math/loading, window/limit/nil-safety, non-blocking
   fan-out, and size-triggered rotation.

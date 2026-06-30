@@ -369,6 +369,38 @@ func TestHandleModelStats(t *testing.T) {
 	}
 }
 
+func TestHandleRequests_Search(t *testing.T) {
+	store := openTestDB(t)
+	if err := store.InsertRequest(db.RequestRecord{
+		RequestID: "r1", Timestamp: time.Now().UTC(), Endpoint: "/api/generate",
+		Model: "llama3", PromptText: "why is the sky blue",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRequest(db.RequestRecord{
+		RequestID: "r2", Timestamp: time.Now().UTC(), Endpoint: "/api/generate",
+		Model: "llama3", PromptText: "tell me a joke",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mux := newTestMux(t, store)
+
+	rr := get(t, mux, "/admin/api/requests?q=joke")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var resp struct {
+		Data  []db.RequestRow `json:"data"`
+		Total int             `json:"total"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 1 || len(resp.Data) != 1 || resp.Data[0].RequestID != "r2" {
+		t.Errorf("search q=joke => total=%d data=%+v", resp.Total, resp.Data)
+	}
+}
+
 func TestHandleExport_CSV(t *testing.T) {
 	store := openTestDB(t)
 	insertSample(t, store, "r1", "llama3", "s1", 10, 20)

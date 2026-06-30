@@ -376,6 +376,80 @@ func TestExportRequests_RespectsFilterAndLimit(t *testing.T) {
 	}
 }
 
+func TestListRequestsFiltered_Query(t *testing.T) {
+	s := openTestDB(t)
+	r1 := sampleRecord("r1")
+	r1.PromptText = "why is the sky blue"
+	r2 := sampleRecord("r2")
+	r2.PromptText = "tell me a joke"
+	r2.ResponseText = "the sky is the limit"
+	_ = s.InsertRequest(r1)
+	_ = s.InsertRequest(r2)
+
+	// Matches r1's prompt only.
+	rows, total, err := s.ListRequestsFiltered(10, 0, RequestFilter{Query: "sky blue"})
+	if err != nil {
+		t.Fatalf("ListRequestsFiltered: %v", err)
+	}
+	if total != 1 || len(rows) != 1 || rows[0].RequestID != "r1" {
+		t.Errorf("query 'sky blue' => total=%d rows=%d", total, len(rows))
+	}
+
+	// Case-insensitive, matches both prompt (r1) and response (r2).
+	_, total, _ = s.ListRequestsFiltered(10, 0, RequestFilter{Query: "SKY"})
+	if total != 2 {
+		t.Errorf("query 'SKY' should match both rows, got %d", total)
+	}
+
+	// LIKE wildcards in the term are matched literally (escaped).
+	_, total, _ = s.ListRequestsFiltered(10, 0, RequestFilter{Query: "%"})
+	if total != 0 {
+		t.Errorf("literal '%%' should match nothing, got %d", total)
+	}
+}
+
+func TestListRequestsFiltered_DateRange(t *testing.T) {
+	s := openTestDB(t)
+	for i, ts := range []time.Time{
+		time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC),
+	} {
+		r := sampleRecord(string(rune('a' + i)))
+		r.Timestamp = ts
+		_ = s.InsertRequest(r)
+	}
+
+	_, total, err := s.ListRequestsFiltered(10, 0, RequestFilter{
+		Since: "2026-04-12T00:00:00Z",
+		Until: "2026-04-18T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("ListRequestsFiltered: %v", err)
+	}
+	if total != 1 {
+		t.Errorf("date range should match exactly the Apr-15 row, got %d", total)
+	}
+}
+
+func TestExportRequestsFiltered_Query(t *testing.T) {
+	s := openTestDB(t)
+	r1 := sampleRecord("r1")
+	r1.Model = "llama3"
+	r2 := sampleRecord("r2")
+	r2.Model = "codellama"
+	_ = s.InsertRequest(r1)
+	_ = s.InsertRequest(r2)
+
+	rows, err := s.ExportRequestsFiltered(1000, RequestFilter{Query: "codel"})
+	if err != nil {
+		t.Fatalf("ExportRequestsFiltered: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Model != "codellama" {
+		t.Errorf("expected only codellama row, got %+v", rows)
+	}
+}
+
 func TestGetSummary_Cost(t *testing.T) {
 	s := openTestDB(t)
 	for i := 0; i < 3; i++ {

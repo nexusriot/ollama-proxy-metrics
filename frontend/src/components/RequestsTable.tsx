@@ -15,6 +15,14 @@ interface Props {
   filterSession: string
   onFilterModel: (m: string) => void
   onFilterSession: (s: string) => void
+  search: string
+  onSearch: (s: string) => void
+  since: string
+  until: string
+  onSince: (s: string) => void
+  onUntil: (s: string) => void
+  hasFilters: boolean
+  onClearFilters: () => void
   currency: string
   live: boolean
   onToggleLive: () => void
@@ -38,6 +46,24 @@ function fmtTime(iso: string): string {
   }
 }
 
+// CopyButton copies text to the clipboard and briefly confirms.
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <button
+      className="copy-btn"
+      onClick={() => {
+        navigator.clipboard?.writeText(text).then(
+          () => { setCopied(true); setTimeout(() => setCopied(false), 1200) },
+          () => { /* clipboard unavailable */ },
+        )
+      }}
+    >
+      {copied ? 'copied ✓' : 'copy'}
+    </button>
+  )
+}
+
 // tokensPerSec estimates generation throughput, excluding time-to-first-token.
 function tokensPerSec(r: RequestRow): number {
   const genMs = r.ttft_ms > 0 ? r.duration_ms - r.ttft_ms : r.duration_ms
@@ -52,6 +78,8 @@ export function RequestsTable({
   onOffsetChange,
   models, filterModel, filterSession,
   onFilterModel, onFilterSession,
+  search, onSearch, since, until, onSince, onUntil,
+  hasFilters, onClearFilters,
   currency, live, onToggleLive, exportHref,
 }: Props) {
   const [expandedId, setExpandedId] = useState<number | null>(null)
@@ -80,8 +108,25 @@ export function RequestsTable({
           placeholder="Filter by session…"
           value={filterSession}
           onChange={e => { onFilterSession(e.target.value); onOffsetChange(0) }}
+          style={{ width: 160 }}
+        />
+        <input
+          placeholder="Search prompt / response…"
+          value={search}
+          onChange={e => onSearch(e.target.value)}
           style={{ width: 200 }}
         />
+        <label className="filter-label" title="Filter requests at or after this time (local)">
+          From
+          <input type="datetime-local" value={since} disabled={live} onChange={e => onSince(e.target.value)} />
+        </label>
+        <label className="filter-label" title="Filter requests at or before this time (local)">
+          To
+          <input type="datetime-local" value={until} disabled={live} onChange={e => onUntil(e.target.value)} />
+        </label>
+        {hasFilters && (
+          <button className="clear-btn" onClick={onClearFilters} title="Clear all filters">✕ clear</button>
+        )}
         <button
           className={live ? 'live-btn live-on' : 'live-btn'}
           onClick={onToggleLive}
@@ -166,16 +211,18 @@ export function RequestsTable({
                         {/* prompt / response */}
                         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
                           <div>
-                            <div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '.07em', color: 'var(--muted)', marginBottom: 6 }}>
-                              Prompt
+                            <div className="detail-head">
+                              <span>Prompt</span>
+                              {r.prompt_text && <CopyButton text={r.prompt_text} />}
                             </div>
                             <pre className="detail-text">
                               {r.prompt_text || <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>— not captured —</span>}
                             </pre>
                           </div>
                           <div>
-                            <div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '.07em', color: 'var(--muted)', marginBottom: 6 }}>
-                              Response
+                            <div className="detail-head">
+                              <span>Response</span>
+                              {r.response_text && <CopyButton text={r.response_text} />}
                             </div>
                             <pre className="detail-text">
                               {r.response_text || <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>— not captured —</span>}

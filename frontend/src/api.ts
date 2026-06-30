@@ -105,12 +105,25 @@ async function post<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
-function requestsQuery(params: { limit?: number; offset?: number; model?: string; session?: string }): URLSearchParams {
+export interface RequestParams {
+  limit?: number
+  offset?: number
+  model?: string
+  session?: string
+  q?: string
+  since?: string
+  until?: string
+}
+
+function requestsQuery(params: RequestParams): URLSearchParams {
   const q = new URLSearchParams()
   if (params.limit)   q.set('limit',   String(params.limit))
   if (params.offset)  q.set('offset',  String(params.offset))
   if (params.model)   q.set('model',   params.model)
   if (params.session) q.set('session', params.session)
+  if (params.q)       q.set('q',       params.q)
+  if (params.since)   q.set('since',   params.since)
+  if (params.until)   q.set('until',   params.until)
   return q
 }
 
@@ -122,12 +135,12 @@ export const api = {
   models:     ()           => get<string[]>('/models'),
   modelStats: ()           => get<ModelStat[]>('/model-stats'),
   pricing:    ()           => get<Pricing>('/pricing'),
-  requests:   (params: { limit?: number; offset?: number; model?: string; session?: string }) =>
+  requests:   (params: RequestParams) =>
     get<RequestsResponse>(`/requests?${requestsQuery(params)}`),
 
-  // URL for the export download (CSV by default, or JSON), honoring filters.
-  exportUrl: (params: { format?: 'csv' | 'json'; model?: string; session?: string }) => {
-    const q = requestsQuery({ model: params.model, session: params.session })
+  // URL for the export download (CSV by default, or JSON), honoring all filters.
+  exportUrl: (params: RequestParams & { format?: 'csv' | 'json' }) => {
+    const q = requestsQuery(params)
     if (params.format) q.set('format', params.format)
     return `${BASE}/export?${q}`
   },

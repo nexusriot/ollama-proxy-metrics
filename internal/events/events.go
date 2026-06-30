@@ -53,7 +53,7 @@ func (b *Broker) Publish(msg []byte) {
 	}
 }
 
-// Subscribers returns the current subscriber count (used by tests/metrics).
+// Subscribers returns the current subscriber count.
 func (b *Broker) Subscribers() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

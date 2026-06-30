@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -101,14 +102,12 @@ func (h *Handler) handleRequests(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit := queryInt(q.Get("limit"), 50)
 	offset := queryInt(q.Get("offset"), 0)
-	model := q.Get("model")
-	sessionID := q.Get("session")
 
 	if limit < 1 || limit > 500 {
 		limit = 50
 	}
 
-	rows, total, err := h.store.ListRequests(limit, offset, model, sessionID)
+	rows, total, err := h.store.ListRequestsFiltered(limit, offset, requestFilter(q))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -224,11 +223,9 @@ func (h *Handler) handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	model := q.Get("model")
-	sessionID := q.Get("session")
 	format := q.Get("format")
 
-	rows, err := h.store.ExportRequests(exportMaxRows, model, sessionID)
+	rows, err := h.store.ExportRequestsFiltered(exportMaxRows, requestFilter(q))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -289,11 +286,19 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
 
+	// Heartbeat keeps idle connections alive through proxies/load balancers that
+	// would otherwise drop a quiet stream.
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+
 	ctx := r.Context()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
 		case msg, ok := <-ch:
 			if !ok {
 				return
@@ -301,6 +306,18 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "data: %s\n\n", msg)
 			flusher.Flush()
 		}
+	}
+}
+
+// requestFilter builds a db.RequestFilter from the query parameters shared by
+// the requests and export endpoints (model, session, q, since, until).
+func requestFilter(q url.Values) db.RequestFilter {
+	return db.RequestFilter{
+		Model:   q.Get("model"),
+		Session: q.Get("session"),
+		Query:   q.Get("q"),
+		Since:   q.Get("since"),
+		Until:   q.Get("until"),
 	}
 }
 

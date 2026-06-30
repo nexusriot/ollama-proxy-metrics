@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   api,
   type Summary, type RequestRow, type DailyStat, type SessionStat,
@@ -14,6 +14,14 @@ type Tab = 'overview' | 'requests' | 'models' | 'sessions'
 
 const PAGE = 50
 const LIVE_CAP = 200
+
+// toISO converts a <input type="datetime-local"> value (local time, no zone)
+// into a UTC RFC3339 string the API can compare against stored timestamps.
+function toISO(local: string): string {
+  if (!local) return ''
+  const d = new Date(local)
+  return isNaN(d.getTime()) ? '' : d.toISOString()
+}
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('overview')
@@ -38,11 +46,13 @@ export default function App() {
   const [offset,        setOffset]        = useState(0)
   const [filterModel,   setFilterModel]   = useState('')
   const [filterSession, setFilterSession] = useState('')
+  const [search,        setSearch]        = useState('')
+  const [since,         setSince]         = useState('') // datetime-local string
+  const [until,         setUntil]         = useState('')
 
   const [live, setLive]         = useState(false)
   const [liveRows, setLiveRows] = useState<RequestRow[]>([])
 
-  const refreshRef = useRef(0)
   const currency = pricing?.currency || 'USD'
 
   const loadSummary = useCallback(async () => {
@@ -59,10 +69,12 @@ export default function App() {
     finally { setLoadingDaily(false) }
   }, [])
 
-  const loadRequests = useCallback(async (off: number, model: string, session: string) => {
+  const loadRequests = useCallback(async (
+    off: number, model: string, session: string, q: string, sinceISO: string, untilISO: string,
+  ) => {
     setLoadingRequests(true)
     try {
-      const res = await api.requests({ limit: PAGE, offset: off, model, session })
+      const res = await api.requests({ limit: PAGE, offset: off, model, session, q, since: sinceISO, until: untilISO })
       setRequests(res.data)
       setReqTotal(res.total)
     }
@@ -112,32 +124,32 @@ export default function App() {
   }
 
   const refreshAll = useCallback(() => {
-    refreshRef.current++
     setError(null)
     void loadSummary()
     void loadDaily(days)
-    void loadRequests(offset, filterModel, filterSession)
+    void loadRequests(offset, filterModel, filterSession, search, toISO(since), toISO(until))
     void loadSessions()
     void loadModelStats()
     void loadModels()
     void loadPricing()
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [days, offset, filterModel, filterSession])
+  }, [days, offset, filterModel, filterSession, search, since, until])
 
   // initial load
   useEffect(() => { refreshAll() }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // re-fetch requests when filters/page change (only in browse mode)
   useEffect(() => {
-    if (!live) void loadRequests(offset, filterModel, filterSession)
-  }, [offset, filterModel, filterSession, live, loadRequests])
+    if (!live) void loadRequests(offset, filterModel, filterSession, search, toISO(since), toISO(until))
+  }, [offset, filterModel, filterSession, search, since, until, live, loadRequests])
 
   // re-fetch daily when days change
   useEffect(() => { void loadDaily(days) }, [days, loadDaily])
 
-  // live tail via Server-Sent Events
+  // live tail via Server-Sent Events — only while the Requests tab is open, so
+  // switching tabs pauses (closes) the stream and returning re-opens it.
   useEffect(() => {
-    if (!live) return
+    if (!live || tab !== 'requests') return
     setLiveRows([])
     const es = new EventSource(api.streamUrl())
     es.onmessage = ev => {
@@ -148,7 +160,7 @@ export default function App() {
     }
     es.onerror = () => setError('Live stream disconnected (is the proxy reachable?)')
     return () => es.close()
-  }, [live])
+  }, [live, tab])
 
   function handleSelectSession(id: string) {
     setFilterSession(id)
@@ -156,9 +168,26 @@ export default function App() {
     setTab('requests')
   }
 
+  function clearFilters() {
+    setFilterModel('')
+    setFilterSession('')
+    setSearch('')
+    setSince('')
+    setUntil('')
+    setOffset(0)
+  }
+  const hasFilters = Boolean(filterModel || filterSession || search || since || until)
+
+  // Wrapper setters reset pagination so a new filter starts from page 1.
+  const onSearch  = (v: string) => { setSearch(v); setOffset(0) }
+  const onSince   = (v: string) => { setSince(v); setOffset(0) }
+  const onUntil   = (v: string) => { setUntil(v); setOffset(0) }
+
+  const q = search.toLowerCase()
   const liveFiltered = liveRows.filter(r =>
     (!filterModel || r.model === filterModel) &&
-    (!filterSession || (r.session_id || '').includes(filterSession)),
+    (!filterSession || (r.session_id || '').includes(filterSession)) &&
+    (!q || `${r.model} ${r.session_id} ${r.endpoint} ${r.prompt_text} ${r.response_text}`.toLowerCase().includes(q)),
   )
   const shownRequests = live ? liveFiltered : requests
   const shownTotal = live ? liveFiltered.length : reqTotal
@@ -232,10 +261,21 @@ export default function App() {
             filterSession={filterSession}
             onFilterModel={setFilterModel}
             onFilterSession={setFilterSession}
+            search={search}
+            onSearch={onSearch}
+            since={since}
+            until={until}
+            onSince={onSince}
+            onUntil={onUntil}
+            hasFilters={hasFilters}
+            onClearFilters={clearFilters}
             currency={currency}
             live={live}
             onToggleLive={() => setLive(v => !v)}
-            exportHref={api.exportUrl({ model: filterModel, session: filterSession })}
+            exportHref={api.exportUrl({
+              model: filterModel, session: filterSession,
+              q: search, since: toISO(since), until: toISO(until),
+            })}
           />
         )}
 

@@ -194,24 +194,58 @@ func scanRow(dbRows *sql.Rows) (RequestRow, error) {
 	return r, nil
 }
 
-// filterClause builds a parameterized WHERE clause from optional model/session filters.
-func filterClause(model, sessionID string) (where string, args []interface{}) {
+// RequestFilter holds the optional filters applied to request list/export
+// queries. Empty fields are ignored.
+type RequestFilter struct {
+	Model   string // exact model match
+	Session string // exact session_id match
+	Query   string // case-insensitive substring across endpoint/model/session/prompt/response
+	Since   string // inclusive lower bound on timestamp (RFC3339; lexical == chronological)
+	Until   string // inclusive upper bound on timestamp (RFC3339)
+}
+
+// filterClause builds a parameterized WHERE clause from a RequestFilter.
+func filterClause(f RequestFilter) (where string, args []interface{}) {
 	conds := []string{"1=1"}
-	if model != "" {
+	if f.Model != "" {
 		conds = append(conds, "model = ?")
-		args = append(args, model)
+		args = append(args, f.Model)
 	}
-	if sessionID != "" {
+	if f.Session != "" {
 		conds = append(conds, "session_id = ?")
-		args = append(args, sessionID)
+		args = append(args, f.Session)
+	}
+	if f.Query != "" {
+		like := "%" + escapeLike(f.Query) + "%"
+		conds = append(conds, "(endpoint LIKE ? ESCAPE '\\' OR model LIKE ? ESCAPE '\\' OR session_id LIKE ? ESCAPE '\\' OR prompt_text LIKE ? ESCAPE '\\' OR response_text LIKE ? ESCAPE '\\')")
+		args = append(args, like, like, like, like, like)
+	}
+	if f.Since != "" {
+		conds = append(conds, "timestamp >= ?")
+		args = append(args, f.Since)
+	}
+	if f.Until != "" {
+		conds = append(conds, "timestamp <= ?")
+		args = append(args, f.Until)
 	}
 	return strings.Join(conds, " AND "), args
 }
 
-// ListRequests returns paginated requests, newest first.
-// Optional model and sessionID filter by those columns when non-empty.
-func (s *Store) ListRequests(limit, offset int, model, sessionID string) (rows []RequestRow, total int, err error) {
-	where, args := filterClause(model, sessionID)
+// escapeLike escapes the LIKE wildcards so a search term is matched literally.
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
+}
+
+// ListRequests returns paginated requests, newest first, optionally filtered by
+// exact model and/or session_id.
+func (s *Store) ListRequests(limit, offset int, model, sessionID string) ([]RequestRow, int, error) {
+	return s.ListRequestsFiltered(limit, offset, RequestFilter{Model: model, Session: sessionID})
+}
+
+// ListRequestsFiltered returns paginated requests, newest first, matching f.
+func (s *Store) ListRequestsFiltered(limit, offset int, f RequestFilter) (rows []RequestRow, total int, err error) {
+	where, args := filterClause(f)
 
 	if err = s.db.QueryRow("SELECT COUNT(*) FROM requests WHERE "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -239,11 +273,15 @@ func (s *Store) ListRequests(limit, offset int, model, sessionID string) (rows [
 	return rows, total, dbRows.Err()
 }
 
-// ExportRequests returns up to limit requests (newest first) matching the
-// optional filters, for CSV/JSON export. It is otherwise like ListRequests
-// without pagination.
+// ExportRequests returns up to limit requests (newest first) matching the model
+// and/or session filters, for CSV/JSON export.
 func (s *Store) ExportRequests(limit int, model, sessionID string) ([]RequestRow, error) {
-	where, args := filterClause(model, sessionID)
+	return s.ExportRequestsFiltered(limit, RequestFilter{Model: model, Session: sessionID})
+}
+
+// ExportRequestsFiltered returns up to limit requests (newest first) matching f.
+func (s *Store) ExportRequestsFiltered(limit int, f RequestFilter) ([]RequestRow, error) {
+	where, args := filterClause(f)
 	query := `SELECT ` + selectColumns + `
 		FROM requests WHERE ` + where + `
 		ORDER BY timestamp DESC

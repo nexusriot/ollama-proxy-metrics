@@ -293,12 +293,13 @@ confirmation prompt).
 ### Requests tab
 
 - Paginated table of every request, newest first, with a **cost** column
-- Filter by model and session ID
+- Filter by model, session ID, **free-text search** (prompt/response/endpoint),
+  and a **date range**; **✕ clear** resets all filters
 - **⤓ CSV** button exports the current (filtered) view; **● Live** streams new
-  requests in real time via SSE
-- Click a row to expand: the captured **prompt** and **response** text, plus
-  request ID, client IP, method, **TTFT**, **throughput (tok/s)**, cost, session,
-  user-agent, and any error details
+  requests in real time via SSE (auto-pauses when you leave the tab)
+- Click a row to expand: the captured **prompt** and **response** text (each with
+  a **copy** button), plus request ID, client IP, method, **TTFT**,
+  **throughput (tok/s)**, cost, session, user-agent, and any error details
 
 ### Models tab
 
@@ -343,6 +344,9 @@ All endpoints return JSON. CORS `*` is enabled for local development.
 | `offset`  | 0       | Pagination offset                |
 | `model`   | —       | Filter by exact model name       |
 | `session` | —       | Filter by session ID             |
+| `q`       | —       | Case-insensitive substring across endpoint/model/session/prompt/response |
+| `since`   | —       | Inclusive lower bound on timestamp (RFC3339) |
+| `until`   | —       | Inclusive upper bound on timestamp (RFC3339) |
 
 **`/admin/api/daily`**
 
@@ -356,8 +360,8 @@ All endpoints return JSON. CORS `*` is enabled for local development.
 |---------|---------|----------------------|
 | `limit` | 50      | Max sessions to return|
 
-**`/admin/api/export`** — accepts `format` (`csv` | `json`), plus `model` and
-`session` filters (same semantics as `/requests`).
+**`/admin/api/export`** — accepts `format` (`csv` | `json`), plus the same
+`model` / `session` / `q` / `since` / `until` filters as `/requests`.
 
 ## SQLite schema
 
