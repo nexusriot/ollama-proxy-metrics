@@ -4,6 +4,7 @@ import {
   Tooltip, Legend, ResponsiveContainer,
 } from 'recharts'
 import type { DailyStat } from '../api'
+import { fmtCost } from '../format'
 
 interface TooltipPayloadItem {
   color: string
@@ -11,10 +12,11 @@ interface TooltipPayloadItem {
   value: number
 }
 
-function CustomTooltip({ active, payload, label }: {
+function CustomTooltip({ active, payload, label, currency }: {
   active?: boolean
   payload?: TooltipPayloadItem[]
   label?: string
+  currency: string
 }) {
   if (!active || !payload?.length) return null
   return (
@@ -22,7 +24,7 @@ function CustomTooltip({ active, payload, label }: {
       <div className="ct-label">{label}</div>
       {payload.map(p => (
         <div key={p.name} style={{ color: p.color }}>
-          {p.name}: <strong>{p.value.toLocaleString()}</strong>
+          {p.name}: <strong>{p.name === 'Cost' ? fmtCost(p.value, currency) : p.value.toLocaleString()}</strong>
         </div>
       ))}
     </div>
@@ -34,10 +36,11 @@ interface Props {
   loading: boolean
   days: number
   onDaysChange: (d: number) => void
+  currency: string
 }
 
-export function DailyChart({ data, loading, days, onDaysChange }: Props) {
-  const [view, setView] = useState<'tokens' | 'requests' | 'duration'>('tokens')
+export function DailyChart({ data, loading, days, onDaysChange, currency }: Props) {
+  const [view, setView] = useState<'tokens' | 'requests' | 'duration' | 'cost'>('tokens')
 
   const chartData = data.map(d => ({
     date: d.date.slice(5), // MM-DD
@@ -45,6 +48,7 @@ export function DailyChart({ data, loading, days, onDaysChange }: Props) {
     'Completion':  d.completion_tokens,
     'Requests':    d.total_requests,
     'Avg ms':      Math.round(d.avg_duration_ms),
+    'Cost':        d.cost,
     errors:        d.error_count,
   }))
 
@@ -53,7 +57,7 @@ export function DailyChart({ data, loading, days, onDaysChange }: Props) {
       <div className="section-header">
         <h2>Daily Usage</h2>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          {(['tokens', 'requests', 'duration'] as const).map(v => (
+          {(['tokens', 'requests', 'duration', 'cost'] as const).map(v => (
             <button
               key={v}
               onClick={() => setView(v)}
@@ -106,7 +110,7 @@ export function DailyChart({ data, loading, days, onDaysChange }: Props) {
                 tickLine={false}
                 width={50}
               />
-              <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(255,255,255,.04)' }} />
+              <Tooltip content={<CustomTooltip currency={currency} />} cursor={{ fill: 'rgba(255,255,255,.04)' }} />
               <Legend
                 wrapperStyle={{ fontSize: 12, color: 'var(--muted)', paddingTop: 8 }}
               />
@@ -122,6 +126,9 @@ export function DailyChart({ data, loading, days, onDaysChange }: Props) {
               )}
               {view === 'duration' && (
                 <Bar dataKey="Avg ms" fill="#fbbf24" radius={[3,3,0,0]} />
+              )}
+              {view === 'cost' && (
+                <Bar dataKey="Cost" fill="#a78bfa" radius={[3,3,0,0]} />
               )}
             </BarChart>
           </ResponsiveContainer>

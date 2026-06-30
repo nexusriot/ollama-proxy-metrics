@@ -299,6 +299,99 @@ func TestGetSummary_Counts(t *testing.T) {
 	}
 }
 
+func TestModelStats_Aggregates(t *testing.T) {
+	s := openTestDB(t)
+	for i := 0; i < 2; i++ {
+		r := sampleRecord(string(rune('a' + i)))
+		r.Model = "llama3"
+		r.PromptTokens = 100
+		r.CompletionTokens = 200
+		r.TotalTokens = 300
+		r.Cost = 1.5
+		_ = s.InsertRequest(r)
+	}
+	r := sampleRecord("c")
+	r.Model = "codellama"
+	r.TotalTokens = 10
+	_ = s.InsertRequest(r)
+
+	stats, err := s.ModelStats(10)
+	if err != nil {
+		t.Fatalf("ModelStats: %v", err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(stats))
+	}
+	// Busiest (most total tokens) first => llama3.
+	if stats[0].Model != "llama3" {
+		t.Errorf("expected llama3 first, got %s", stats[0].Model)
+	}
+	if stats[0].TotalRequests != 2 || stats[0].TotalTokens != 600 {
+		t.Errorf("llama3 aggregates wrong: req=%d tokens=%d", stats[0].TotalRequests, stats[0].TotalTokens)
+	}
+	if stats[0].Cost != 3.0 {
+		t.Errorf("expected llama3 cost=3.0, got %v", stats[0].Cost)
+	}
+}
+
+func TestModelStats_ExcludesUnknown(t *testing.T) {
+	s := openTestDB(t)
+	r := sampleRecord("u")
+	r.Model = "unknown"
+	_ = s.InsertRequest(r)
+	stats, err := s.ModelStats(10)
+	if err != nil {
+		t.Fatalf("ModelStats: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Errorf("expected 'unknown' excluded, got %d rows", len(stats))
+	}
+}
+
+func TestExportRequests_RespectsFilterAndLimit(t *testing.T) {
+	s := openTestDB(t)
+	for i := 0; i < 5; i++ {
+		r := sampleRecord(string(rune('a' + i)))
+		r.Model = "llama3"
+		_ = s.InsertRequest(r)
+	}
+	r := sampleRecord("other")
+	r.Model = "codellama"
+	_ = s.InsertRequest(r)
+
+	rows, err := s.ExportRequests(1000, "llama3", "")
+	if err != nil {
+		t.Fatalf("ExportRequests: %v", err)
+	}
+	if len(rows) != 5 {
+		t.Errorf("expected 5 llama3 rows, got %d", len(rows))
+	}
+
+	limited, err := s.ExportRequests(2, "", "")
+	if err != nil {
+		t.Fatalf("ExportRequests limited: %v", err)
+	}
+	if len(limited) != 2 {
+		t.Errorf("expected limit of 2 respected, got %d", len(limited))
+	}
+}
+
+func TestGetSummary_Cost(t *testing.T) {
+	s := openTestDB(t)
+	for i := 0; i < 3; i++ {
+		r := sampleRecord(string(rune('a' + i)))
+		r.Cost = 2.5
+		_ = s.InsertRequest(r)
+	}
+	sum, err := s.GetSummary()
+	if err != nil {
+		t.Fatalf("GetSummary: %v", err)
+	}
+	if sum.Cost != 7.5 {
+		t.Errorf("expected total cost 7.5, got %v", sum.Cost)
+	}
+}
+
 func TestModels_ReturnsDistinct(t *testing.T) {
 	s := openTestDB(t)
 	for i, m := range []string{"a", "b", "a"} {

@@ -1,13 +1,18 @@
 package api
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/nexusriot/ollama-proxy-metrics/internal/db"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/events"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/pricing"
 )
 
 func openTestDB(t *testing.T) *db.Store {
@@ -23,7 +28,7 @@ func openTestDB(t *testing.T) *db.Store {
 func newTestMux(t *testing.T, store *db.Store) *http.ServeMux {
 	t.Helper()
 	mux := http.NewServeMux()
-	h := New(store)
+	h := New(store, nil, nil)
 	h.Register(mux, "/admin/api")
 	return mux
 }
@@ -338,5 +343,142 @@ func TestHandleCleanup_IdempotentOnEmptyDB(t *testing.T) {
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200 on empty DB, got %d", rr.Code)
+	}
+}
+
+func TestHandleModelStats(t *testing.T) {
+	store := openTestDB(t)
+	insertSample(t, store, "r1", "llama3", "s1", 10, 20)
+	insertSample(t, store, "r2", "llama3", "s1", 10, 20)
+	insertSample(t, store, "r3", "codellama", "s1", 5, 5)
+	mux := newTestMux(t, store)
+
+	rr := get(t, mux, "/admin/api/model-stats")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var stats []db.ModelStat
+	if err := json.NewDecoder(rr.Body).Decode(&stats); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(stats))
+	}
+	if stats[0].Model != "llama3" || stats[0].TotalRequests != 2 {
+		t.Errorf("unexpected busiest model: %+v", stats[0])
+	}
+}
+
+func TestHandleExport_CSV(t *testing.T) {
+	store := openTestDB(t)
+	insertSample(t, store, "r1", "llama3", "s1", 10, 20)
+	mux := newTestMux(t, store)
+
+	rr := get(t, mux, "/admin/api/export") // default format = csv
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "text/csv" {
+		t.Errorf("expected text/csv, got %q", ct)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "request_id,session_id") {
+		t.Errorf("missing CSV header: %q", body)
+	}
+	if !strings.Contains(body, "r1") {
+		t.Errorf("missing data row: %q", body)
+	}
+}
+
+func TestHandleExport_JSON(t *testing.T) {
+	store := openTestDB(t)
+	insertSample(t, store, "r1", "llama3", "s1", 10, 20)
+	mux := newTestMux(t, store)
+
+	rr := get(t, mux, "/admin/api/export?format=json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var rows []db.RequestRow
+	if err := json.NewDecoder(rr.Body).Decode(&rows); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(rows) != 1 || rows[0].RequestID != "r1" {
+		t.Errorf("unexpected export rows: %+v", rows)
+	}
+}
+
+func TestHandlePricing(t *testing.T) {
+	store := openTestDB(t)
+	prices := &pricing.Table{Currency: "EUR", Models: map[string]pricing.ModelRate{
+		"m": {PromptPer1K: 1, CompletionPer1K: 2},
+	}}
+	mux := http.NewServeMux()
+	New(store, prices, nil).Register(mux, "/admin/api")
+
+	rr := get(t, mux, "/admin/api/pricing")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var got pricing.Table
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Currency != "EUR" || got.Models["m"].CompletionPer1K != 2 {
+		t.Errorf("unexpected pricing payload: %+v", got)
+	}
+}
+
+func TestHandleStream_NoBrokerReturns503(t *testing.T) {
+	mux := newTestMux(t, openTestDB(t)) // newTestMux passes nil broker
+	rr := get(t, mux, "/admin/api/stream")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 without broker, got %d", rr.Code)
+	}
+}
+
+func TestHandleStream_PushesEvent(t *testing.T) {
+	store := openTestDB(t)
+	broker := events.NewBroker()
+	mux := http.NewServeMux()
+	New(store, nil, broker).Register(mux, "/admin/api")
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/admin/api/stream", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer resp.Body.Close()
+
+	lines := make(chan string, 16)
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+
+	// Wait until the handler has subscribed, then publish an event.
+	deadline := time.Now().Add(2 * time.Second)
+	for broker.Subscribers() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	broker.Publish([]byte(`{"request_id":"live-1"}`))
+
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case l := <-lines:
+			if strings.Contains(l, "live-1") {
+				return // success
+			}
+		case <-timeout:
+			t.Fatal("did not receive streamed event within timeout")
+		}
 	}
 }

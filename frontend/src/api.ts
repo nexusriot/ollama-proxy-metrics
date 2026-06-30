@@ -6,6 +6,7 @@ export interface Summary {
   completion_tokens: number
   total_tokens: number
   avg_duration_ms: number
+  cost: number
   unique_sessions: number
   unique_models: string[]
   error_count: number
@@ -22,11 +23,13 @@ export interface RequestRow {
   stream: boolean
   status_code: number
   duration_ms: number
+  ttft_ms: number
   request_bytes: number
   response_bytes: number
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  cost: number
   error_message: string
   client_ip: string
   user_agent: string
@@ -48,6 +51,7 @@ export interface DailyStat {
   completion_tokens: number
   total_tokens: number
   avg_duration_ms: number
+  cost: number
   error_count: number
 }
 
@@ -58,8 +62,35 @@ export interface SessionStat {
   completion_tokens: number
   total_tokens: number
   avg_duration_ms: number
+  cost: number
   first_seen: string
   last_seen: string
+}
+
+export interface ModelStat {
+  model: string
+  total_requests: number
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  avg_duration_ms: number
+  avg_ttft_ms: number
+  tokens_per_sec: number
+  cost: number
+  error_count: number
+  first_seen: string
+  last_seen: string
+}
+
+export interface ModelRate {
+  prompt_per_1k: number
+  completion_per_1k: number
+}
+
+export interface Pricing {
+  currency: string
+  default: ModelRate
+  models: Record<string, ModelRate>
 }
 
 async function get<T>(path: string): Promise<T> {
@@ -74,18 +105,33 @@ async function post<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
+function requestsQuery(params: { limit?: number; offset?: number; model?: string; session?: string }): URLSearchParams {
+  const q = new URLSearchParams()
+  if (params.limit)   q.set('limit',   String(params.limit))
+  if (params.offset)  q.set('offset',  String(params.offset))
+  if (params.model)   q.set('model',   params.model)
+  if (params.session) q.set('session', params.session)
+  return q
+}
+
 export const api = {
-  summary: () => get<Summary>('/summary'),
-  cleanup: () => post<{ status: string }>('/cleanup'),
-  requests: (params: { limit?: number; offset?: number; model?: string; session?: string }) => {
-    const q = new URLSearchParams()
-    if (params.limit)   q.set('limit',   String(params.limit))
-    if (params.offset)  q.set('offset',  String(params.offset))
-    if (params.model)   q.set('model',   params.model)
-    if (params.session) q.set('session', params.session)
-    return get<RequestsResponse>(`/requests?${q}`)
+  summary:    ()           => get<Summary>('/summary'),
+  cleanup:    ()           => post<{ status: string }>('/cleanup'),
+  daily:      (days = 30)  => get<DailyStat[]>(`/daily?days=${days}`),
+  sessions:   (limit = 50) => get<SessionStat[]>(`/sessions?limit=${limit}`),
+  models:     ()           => get<string[]>('/models'),
+  modelStats: ()           => get<ModelStat[]>('/model-stats'),
+  pricing:    ()           => get<Pricing>('/pricing'),
+  requests:   (params: { limit?: number; offset?: number; model?: string; session?: string }) =>
+    get<RequestsResponse>(`/requests?${requestsQuery(params)}`),
+
+  // URL for the export download (CSV by default, or JSON), honoring filters.
+  exportUrl: (params: { format?: 'csv' | 'json'; model?: string; session?: string }) => {
+    const q = requestsQuery({ model: params.model, session: params.session })
+    if (params.format) q.set('format', params.format)
+    return `${BASE}/export?${q}`
   },
-  daily:    (days = 30)  => get<DailyStat[]>(`/daily?days=${days}`),
-  sessions: (limit = 50) => get<SessionStat[]>(`/sessions?limit=${limit}`),
-  models:   ()           => get<string[]>('/models'),
+
+  // Open a Server-Sent Events stream of newly recorded requests.
+  streamUrl: () => `${BASE}/stream`,
 }

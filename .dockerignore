@@ -1,4 +1,19 @@
+# Frontend build artifacts (the frontend image installs deps & builds fresh)
 frontend/node_modules
 frontend/dist
+
+# Local runtime data — never needed at build time (SQLite DB, WAL/SHM, logs).
+# Without this, `docker build` ships the whole DB into the build context.
+data/
+
+# Local secrets / environment (compose reads .env from the host at deploy time,
+# not from the image — keep it out of the build context entirely).
+.env
+
+# Host-built Go binary (the image builds its own static binary)
+ollama-proxy
+
+# VCS metadata and docs
 .git
+.gitignore
 *.md

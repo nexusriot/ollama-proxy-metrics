@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { RequestRow } from '../api'
+import { fmtCost } from '../format'
 
 const PAGE = 50
 
@@ -14,6 +15,10 @@ interface Props {
   filterSession: string
   onFilterModel: (m: string) => void
   onFilterSession: (s: string) => void
+  currency: string
+  live: boolean
+  onToggleLive: () => void
+  exportHref: string
 }
 
 function fmtBytes(b: number): string {
@@ -33,11 +38,21 @@ function fmtTime(iso: string): string {
   }
 }
 
+// tokensPerSec estimates generation throughput, excluding time-to-first-token.
+function tokensPerSec(r: RequestRow): number {
+  const genMs = r.ttft_ms > 0 ? r.duration_ms - r.ttft_ms : r.duration_ms
+  if (genMs <= 0 || r.completion_tokens <= 0) return 0
+  return r.completion_tokens / (genMs / 1000)
+}
+
+const COLS = 10
+
 export function RequestsTable({
   data, total, loading, offset,
   onOffsetChange,
   models, filterModel, filterSession,
   onFilterModel, onFilterSession,
+  currency, live, onToggleLive, exportHref,
 }: Props) {
   const [expandedId, setExpandedId] = useState<number | null>(null)
 
@@ -48,7 +63,9 @@ export function RequestsTable({
     <div className="section">
       <div className="section-header">
         <h2>Requests</h2>
-        <span style={{ fontSize: 12, color: 'var(--muted)' }}>{total.toLocaleString()} total</span>
+        <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+          {live ? `${data.length} live` : `${total.toLocaleString()} total`}
+        </span>
       </div>
 
       <div className="filters">
@@ -65,6 +82,15 @@ export function RequestsTable({
           onChange={e => { onFilterSession(e.target.value); onOffsetChange(0) }}
           style={{ width: 200 }}
         />
+        <button
+          className={live ? 'live-btn live-on' : 'live-btn'}
+          onClick={onToggleLive}
+          title="Stream new requests as they happen"
+          style={{ marginLeft: 'auto' }}
+        >
+          {live ? '● Live' : '○ Live'}
+        </button>
+        <a className="export-btn" href={exportHref}>⤓ CSV</a>
       </div>
 
       <div className="table-wrap">
@@ -78,6 +104,7 @@ export function RequestsTable({
               <th>Status</th>
               <th>Duration</th>
               <th>Tokens (P+C)</th>
+              <th>Cost</th>
               <th>Bytes In/Out</th>
               <th>Session</th>
             </tr>
@@ -86,20 +113,22 @@ export function RequestsTable({
             {loading ? (
               Array.from({ length: 8 }).map((_, i) => (
                 <tr key={i}>
-                  {Array.from({ length: 9 }).map((__, j) => (
+                  {Array.from({ length: COLS }).map((__, j) => (
                     <td key={j}><div className="skeleton" style={{ width: '80%' }} /></td>
                   ))}
                 </tr>
               ))
             ) : data.length === 0 ? (
               <tr>
-                <td colSpan={9} className="empty">No requests yet.</td>
+                <td colSpan={COLS} className="empty">
+                  {live ? 'Waiting for live requests…' : 'No requests yet.'}
+                </td>
               </tr>
             ) : (
               data.map(r => (
                 <>
                   <tr
-                    key={r.id}
+                    key={r.id || r.request_id}
                     style={{ cursor: 'pointer' }}
                     onClick={() => setExpandedId(expandedId === r.id ? null : r.id)}
                   >
@@ -122,6 +151,7 @@ export function RequestsTable({
                       {' '}
                       <span style={{ color: 'var(--muted)' }}>= {r.total_tokens.toLocaleString()}</span>
                     </td>
+                    <td className="mono">{r.cost > 0 ? fmtCost(r.cost, currency) : '—'}</td>
                     <td className="mono" style={{ color: 'var(--muted)' }}>
                       {fmtBytes(r.request_bytes)} / {fmtBytes(r.response_bytes)}
                     </td>
@@ -131,7 +161,7 @@ export function RequestsTable({
                   </tr>
                   {expandedId === r.id && (
                     <tr key={`${r.id}-detail`} style={{ background: 'rgba(99,102,241,.04)' }}>
-                      <td colSpan={9} style={{ padding: '16px 18px' }}>
+                      <td colSpan={COLS} style={{ padding: '16px 18px' }}>
 
                         {/* prompt / response */}
                         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
@@ -158,6 +188,9 @@ export function RequestsTable({
                           <div><span style={{ color: 'var(--muted)' }}>Request ID </span><span className="mono" style={{ fontSize: 11 }}>{r.request_id}</span></div>
                           <div><span style={{ color: 'var(--muted)' }}>Client IP </span>{r.client_ip || '—'}</div>
                           <div><span style={{ color: 'var(--muted)' }}>Method </span>{r.method}</div>
+                          <div><span style={{ color: 'var(--muted)' }}>TTFT </span>{r.ttft_ms > 0 ? `${r.ttft_ms}ms` : '—'}</div>
+                          <div><span style={{ color: 'var(--muted)' }}>Throughput </span>{tokensPerSec(r) > 0 ? `${tokensPerSec(r).toFixed(1)} tok/s` : '—'}</div>
+                          <div><span style={{ color: 'var(--muted)' }}>Cost </span>{r.cost > 0 ? fmtCost(r.cost, currency) : '—'}</div>
                           <div><span style={{ color: 'var(--muted)' }}>Session </span><span className="mono" style={{ fontSize: 11 }}>{r.session_id || '—'}</span></div>
                           <div style={{ gridColumn: '1 / -1' }}><span style={{ color: 'var(--muted)' }}>User-Agent </span>{r.user_agent || '—'}</div>
                           {r.error_message && (
@@ -177,13 +210,15 @@ export function RequestsTable({
         </table>
       </div>
 
-      <div className="pagination">
-        <span>Page {page} of {pages}</span>
-        <button disabled={offset === 0} onClick={() => onOffsetChange(0)}>«</button>
-        <button disabled={offset === 0} onClick={() => onOffsetChange(Math.max(0, offset - PAGE))}>‹</button>
-        <button disabled={offset + PAGE >= total} onClick={() => onOffsetChange(offset + PAGE)}>›</button>
-        <button disabled={offset + PAGE >= total} onClick={() => onOffsetChange((pages - 1) * PAGE)}>»</button>
-      </div>
+      {!live && (
+        <div className="pagination">
+          <span>Page {page} of {pages}</span>
+          <button disabled={offset === 0} onClick={() => onOffsetChange(0)}>«</button>
+          <button disabled={offset === 0} onClick={() => onOffsetChange(Math.max(0, offset - PAGE))}>‹</button>
+          <button disabled={offset + PAGE >= total} onClick={() => onOffsetChange(offset + PAGE)}>›</button>
+          <button disabled={offset + PAGE >= total} onClick={() => onOffsetChange((pages - 1) * PAGE)}>»</button>
+        </div>
+      )}
     </div>
   )
 }

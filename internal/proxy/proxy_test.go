@@ -11,11 +11,33 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/nexusriot/ollama-proxy-metrics/internal/db"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/events"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/pricing"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/ratelimit"
 )
+
+func mustURL(t *testing.T, s string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(s)
+	if err != nil {
+		t.Fatalf("parse url %q: %v", s, err)
+	}
+	return u
+}
+
+// newHandler builds a Handler with explicit upstreams/pricing/limiter/broker.
+func newHandler(t *testing.T, upstreams []*url.URL, prices *pricing.Table, limiter *ratelimit.Limiter, broker *events.Broker) *Handler {
+	t.Helper()
+	store := openTestDB(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := prometheus.NewRegistry()
+	return New(upstreams, store, logger, NewMetrics(reg), prices, broker, limiter)
+}
 
 func openTestDB(t *testing.T) *db.Store {
 	t.Helper()
@@ -37,7 +59,7 @@ func newTestHandler(t *testing.T, upstreamURL string) *Handler {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := prometheus.NewRegistry()
 	metrics := NewMetrics(reg)
-	return New(u, store, logger, metrics)
+	return New([]*url.URL{u}, store, logger, metrics, nil, nil, nil)
 }
 
 func TestServeHTTP_NonStream_ProxiesBody(t *testing.T) {
@@ -263,5 +285,176 @@ func TestServeHTTP_PersistsRequestAndResponseBytes(t *testing.T) {
 	// response bytes should match (respPayload length)
 	if r.ResponseBytes != int64(len(respPayload)) {
 		t.Errorf("response_bytes mismatch: want %d got %d", len(respPayload), r.ResponseBytes)
+	}
+}
+
+func TestServeHTTP_OpenAI_NonStream_Usage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"hi there"}}],"usage":{"prompt_tokens":5,"completion_tokens":8,"total_tokens":13}}`)
+	}))
+	defer upstream.Close()
+
+	h := newHandler(t, []*url.URL{mustURL(t, upstream.URL)}, nil, nil, nil)
+	// OpenAI default is non-streaming when "stream" is absent.
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	rows, _, _ := h.store.ListRequests(1, 0, "", "")
+	if len(rows) == 0 {
+		t.Fatal("expected persisted row")
+	}
+	r := rows[0]
+	if r.PromptTokens != 5 || r.CompletionTokens != 8 || r.TotalTokens != 13 {
+		t.Errorf("openai usage not extracted: pt=%d ct=%d tt=%d", r.PromptTokens, r.CompletionTokens, r.TotalTokens)
+	}
+	if r.Stream {
+		t.Error("expected stream=false for /v1 without stream flag")
+	}
+	if r.ResponseText != "hi there" {
+		t.Errorf("expected response text 'hi there', got %q", r.ResponseText)
+	}
+}
+
+func TestServeHTTP_OpenAI_Stream_SSE(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		events := []string{
+			`data: {"choices":[{"delta":{"content":"Hel"}}]}`,
+			`data: {"choices":[{"delta":{"content":"lo"}}]}`,
+			`data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`,
+			`data: [DONE]`,
+		}
+		for _, e := range events {
+			_, _ = fmt.Fprintf(w, "%s\n\n", e) // SSE event terminator is a blank line
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	h := newHandler(t, []*url.URL{mustURL(t, upstream.URL)}, nil, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	// SSE framing (blank line between events) must be preserved to the client.
+	if !strings.Contains(rr.Body.String(), "data: [DONE]") {
+		t.Errorf("forwarded body missing [DONE]: %q", rr.Body.String())
+	}
+
+	rows, _, _ := h.store.ListRequests(1, 0, "", "")
+	if len(rows) == 0 {
+		t.Fatal("expected persisted row")
+	}
+	r := rows[0]
+	if r.PromptTokens != 11 || r.CompletionTokens != 22 {
+		t.Errorf("openai stream usage not extracted: pt=%d ct=%d", r.PromptTokens, r.CompletionTokens)
+	}
+	if r.ResponseText != "Hello" {
+		t.Errorf("expected accumulated 'Hello', got %q", r.ResponseText)
+	}
+	if !r.Stream {
+		t.Error("expected stream=true")
+	}
+}
+
+func TestForward_FailoverToSecondUpstream(t *testing.T) {
+	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"response":"ok","done":true,"eval_count":1,"prompt_eval_count":1}`)
+	}))
+	defer alive.Close()
+
+	// Dead upstream listed first; the proxy must fail over to the alive one.
+	ups := []*url.URL{mustURL(t, "http://127.0.0.1:1"), mustURL(t, alive.URL)}
+	h := newHandler(t, ups, nil, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/generate",
+		strings.NewReader(`{"model":"m","stream":false}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected failover to succeed with 200, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "ok") {
+		t.Errorf("expected response from alive upstream, got %q", rr.Body.String())
+	}
+}
+
+func TestServeHTTP_RateLimit_Returns429(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"response":"x","done":true}`)
+	}))
+	defer upstream.Close()
+
+	limiter := ratelimit.New(1, time.Minute) // 1 request per session per minute
+	h := newHandler(t, []*url.URL{mustURL(t, upstream.URL)}, nil, limiter, nil)
+
+	do := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/api/generate",
+			strings.NewReader(`{"model":"m","stream":false}`))
+		req.Header.Set("X-Session-ID", "same-session")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	if code := do(); code != http.StatusOK {
+		t.Fatalf("first request should pass, got %d", code)
+	}
+	if code := do(); code != http.StatusTooManyRequests {
+		t.Errorf("second request should be rate limited (429), got %d", code)
+	}
+}
+
+func TestServeHTTP_Cost_Recorded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"response":"x","done":true,"eval_count":1000,"prompt_eval_count":1000}`)
+	}))
+	defer upstream.Close()
+
+	prices := &pricing.Table{
+		Currency: "USD",
+		Models:   map[string]pricing.ModelRate{"gpt-4o": {PromptPer1K: 5, CompletionPer1K: 15}},
+	}
+	h := newHandler(t, []*url.URL{mustURL(t, upstream.URL)}, prices, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/generate",
+		strings.NewReader(`{"model":"gpt-4o","stream":false}`))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	rows, _, _ := h.store.ListRequests(1, 0, "", "")
+	if len(rows) == 0 {
+		t.Fatal("expected persisted row")
+	}
+	if got := rows[0].Cost; got != 20.0 { // 1000/1000*5 + 1000/1000*15
+		t.Errorf("expected cost=20, got %v", got)
+	}
+}
+
+func TestDetermineStream(t *testing.T) {
+	b := func(v bool) *bool { return &v }
+	cases := []struct {
+		name     string
+		method   string
+		endpoint string
+		openai   bool
+		flag     *bool
+		want     bool
+	}{
+		{"native generate default true", "POST", "/api/generate", false, nil, true},
+		{"native generate explicit false", "POST", "/api/generate", false, b(false), false},
+		{"native embed never streams", "POST", "/api/embed", false, nil, false},
+		{"openai default false", "POST", "/v1/chat/completions", true, nil, false},
+		{"openai explicit true", "POST", "/v1/chat/completions", true, b(true), true},
+		{"openai embeddings never streams", "POST", "/v1/embeddings", true, b(true), false},
+		{"GET never streams", "GET", "/api/tags", false, nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := determineStream(c.method, c.endpoint, c.openai, c.flag); got != c.want {
+				t.Errorf("determineStream=%v want %v", got, c.want)
+			}
+		})
 	}
 }
