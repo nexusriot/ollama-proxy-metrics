@@ -27,8 +27,13 @@ services:
       DB_PATH:         "${DB_PATH:-/data/db.sqlite}"
       LOG_PATH:        "${LOG_PATH:-/data/logs/proxy.log}"
       LISTEN_ADDR:     "${LISTEN_ADDR:-:8080}"
+      RATE_LIMIT_RPM:  "${RATE_LIMIT_RPM:-0}"     # per-session requests/min; 0 = unlimited
+      LOG_MAX_MB:      "${LOG_MAX_MB:-50}"        # rotate proxy.log past this size
+      LOG_MAX_BACKUPS: "${LOG_MAX_BACKUPS:-5}"
+      PRICING_PATH:    "${PRICING_PATH:-}"        # e.g. /data/pricing.json (see pricing.example.json)
     volumes:
       - ./data:/data              # persistent SQLite DB + logs
+#      - ./pricing.example.json:/data/pricing.json:ro   # then set PRICING_PATH=/data/pricing.json
 #    depends_on:
 #      - ollama
     restart: unless-stopped
@@ -61,6 +66,26 @@ services:
     profiles:
       - monitoring   # opt-in: docker compose --profile monitoring up
 
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      # Local-only convenience: anonymous admin access, no login wall.
+      GF_AUTH_ANONYMOUS_ENABLED:  "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    profiles:
+      - monitoring   # opt-in: docker compose --profile monitoring up
+
 volumes:
   ollama-models:   # Ollama model files
   prometheus-data: # Prometheus TSDB
+  grafana-data:    # Grafana state

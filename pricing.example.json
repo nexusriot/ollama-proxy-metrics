@@ -1,0 +1,11 @@
+{
+  "_comment": "Per-1,000-token rates used for cost estimation. Local Ollama is free (0); list hosted models to estimate what equivalent traffic would have cost. Point PRICING_PATH at a copy of this file to enable the Est. Cost column and ollama_proxy_cost_total metric.",
+  "currency": "USD",
+  "default": { "prompt_per_1k": 0, "completion_per_1k": 0 },
+  "models": {
+    "llama3":           { "prompt_per_1k": 0,    "completion_per_1k": 0 },
+    "gpt-4o":           { "prompt_per_1k": 2.5,  "completion_per_1k": 10 },
+    "gpt-4o-mini":      { "prompt_per_1k": 0.15, "completion_per_1k": 0.6 },
+    "claude-sonnet-4":  { "prompt_per_1k": 3,    "completion_per_1k": 15 }
+  }
+}

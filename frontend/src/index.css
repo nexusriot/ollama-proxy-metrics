@@ -207,6 +207,82 @@ tbody td { padding: 9px 14px; white-space: nowrap; }
 }
 .filters select:focus, .filters input:focus { border-color: var(--accent); }
 
+.filter-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.filter-label input[type="datetime-local"] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  outline: none;
+  color-scheme: dark;
+}
+.filter-label input:focus { border-color: var(--accent); }
+.filter-label input:disabled { opacity: .45; cursor: not-allowed; }
+
+.clear-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  cursor: pointer;
+  padding: 5px 10px;
+  font-size: 12px;
+  transition: color .15s, border-color .15s;
+}
+.clear-btn:hover { color: var(--red); border-color: var(--red); }
+
+.detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.copy-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 5px;
+  cursor: pointer;
+  padding: 1px 8px;
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+  transition: color .15s, border-color .15s;
+}
+.copy-btn:hover { color: var(--text); border-color: var(--text); }
+
+.live-btn, .export-btn {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  cursor: pointer;
+  padding: 5px 12px;
+  font-size: 13px;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.live-btn:hover, .export-btn:hover { color: var(--text); border-color: var(--text); }
+.live-btn.live-on {
+  color: var(--green);
+  border-color: rgba(52,211,153,.5);
+  background: rgba(52,211,153,.1);
+}
+
 .days-select {
   background: var(--bg);
   border: 1px solid var(--border);

@@ -1,9 +1,11 @@
 import type { SessionStat } from '../api'
+import { fmtCost } from '../format'
 
 interface Props {
   data: SessionStat[]
   loading: boolean
   onSelectSession: (id: string) => void
+  currency: string
 }
 
 function fmtDate(iso: string): string {
@@ -17,7 +19,7 @@ function fmtDate(iso: string): string {
   }
 }
 
-export function SessionsTable({ data, loading, onSelectSession }: Props) {
+export function SessionsTable({ data, loading, onSelectSession, currency }: Props) {
   return (
     <div className="section">
       <div className="section-header">
@@ -35,6 +37,7 @@ export function SessionsTable({ data, loading, onSelectSession }: Props) {
               <th>Completion Tokens</th>
               <th>Total Tokens</th>
               <th>Avg Duration</th>
+              <th>Cost</th>
               <th>First Seen</th>
               <th>Last Seen</th>
             </tr>
@@ -43,14 +46,14 @@ export function SessionsTable({ data, loading, onSelectSession }: Props) {
             {loading ? (
               Array.from({ length: 5 }).map((_, i) => (
                 <tr key={i}>
-                  {Array.from({ length: 8 }).map((__, j) => (
+                  {Array.from({ length: 9 }).map((__, j) => (
                     <td key={j}><div className="skeleton" style={{ width: '80%' }} /></td>
                   ))}
                 </tr>
               ))
             ) : data.length === 0 ? (
               <tr>
-                <td colSpan={8} className="empty">
+                <td colSpan={9} className="empty">
                   No sessions yet. Send requests with an <code>X-Session-ID</code> header,
                   or the proxy will group by client IP.
                 </td>
@@ -71,6 +74,7 @@ export function SessionsTable({ data, loading, onSelectSession }: Props) {
                   <td className="mono">{s.completion_tokens.toLocaleString()}</td>
                   <td className="mono" style={{ fontWeight: 600 }}>{s.total_tokens.toLocaleString()}</td>
                   <td className="mono">{Math.round(s.avg_duration_ms)}ms</td>
+                  <td className="mono">{fmtCost(s.cost, currency)}</td>
                   <td style={{ color: 'var(--muted)', fontSize: 12 }}>{fmtDate(s.first_seen)}</td>
                   <td style={{ color: 'var(--muted)', fontSize: 12 }}>{fmtDate(s.last_seen)}</td>
                 </tr>

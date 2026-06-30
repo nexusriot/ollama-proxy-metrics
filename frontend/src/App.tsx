@@ -1,36 +1,59 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, type Summary, type RequestRow, type DailyStat, type SessionStat } from './api'
+import { useCallback, useEffect, useState } from 'react'
+import {
+  api,
+  type Summary, type RequestRow, type DailyStat, type SessionStat,
+  type ModelStat, type Pricing,
+} from './api'
 import { SummaryCards } from './components/SummaryCards'
 import { DailyChart } from './components/DailyChart'
 import { RequestsTable } from './components/RequestsTable'
 import { SessionsTable } from './components/SessionsTable'
+import { ModelsTable } from './components/ModelsTable'
 
-type Tab = 'overview' | 'requests' | 'sessions'
+type Tab = 'overview' | 'requests' | 'models' | 'sessions'
 
 const PAGE = 50
+const LIVE_CAP = 200
+
+// toISO converts a <input type="datetime-local"> value (local time, no zone)
+// into a UTC RFC3339 string the API can compare against stored timestamps.
+function toISO(local: string): string {
+  if (!local) return ''
+  const d = new Date(local)
+  return isNaN(d.getTime()) ? '' : d.toISOString()
+}
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('overview')
 
-  const [summary, setSummary]   = useState<Summary | null>(null)
-  const [daily, setDaily]       = useState<DailyStat[]>([])
-  const [requests, setRequests] = useState<RequestRow[]>([])
-  const [reqTotal, setReqTotal] = useState(0)
-  const [sessions, setSessions] = useState<SessionStat[]>([])
-  const [models, setModels]     = useState<string[]>([])
-  const [error, setError]       = useState<string | null>(null)
+  const [summary, setSummary]     = useState<Summary | null>(null)
+  const [daily, setDaily]         = useState<DailyStat[]>([])
+  const [requests, setRequests]   = useState<RequestRow[]>([])
+  const [reqTotal, setReqTotal]   = useState(0)
+  const [sessions, setSessions]   = useState<SessionStat[]>([])
+  const [modelStats, setModelStats] = useState<ModelStat[]>([])
+  const [models, setModels]       = useState<string[]>([])
+  const [pricing, setPricing]     = useState<Pricing | null>(null)
+  const [error, setError]         = useState<string | null>(null)
 
   const [loadingSummary,  setLoadingSummary]  = useState(true)
   const [loadingDaily,    setLoadingDaily]    = useState(true)
   const [loadingRequests, setLoadingRequests] = useState(true)
   const [loadingSessions, setLoadingSessions] = useState(true)
+  const [loadingModels,   setLoadingModels]   = useState(true)
 
   const [days,          setDays]          = useState(30)
   const [offset,        setOffset]        = useState(0)
   const [filterModel,   setFilterModel]   = useState('')
   const [filterSession, setFilterSession] = useState('')
+  const [search,        setSearch]        = useState('')
+  const [since,         setSince]         = useState('') // datetime-local string
+  const [until,         setUntil]         = useState('')
 
-  const refreshRef = useRef(0)
+  const [live, setLive]         = useState(false)
+  const [liveRows, setLiveRows] = useState<RequestRow[]>([])
+
+  const currency = pricing?.currency || 'USD'
 
   const loadSummary = useCallback(async () => {
     setLoadingSummary(true)
@@ -46,10 +69,12 @@ export default function App() {
     finally { setLoadingDaily(false) }
   }, [])
 
-  const loadRequests = useCallback(async (off: number, model: string, session: string) => {
+  const loadRequests = useCallback(async (
+    off: number, model: string, session: string, q: string, sinceISO: string, untilISO: string,
+  ) => {
     setLoadingRequests(true)
     try {
-      const res = await api.requests({ limit: PAGE, offset: off, model, session })
+      const res = await api.requests({ limit: PAGE, offset: off, model, session, q, since: sinceISO, until: untilISO })
       setRequests(res.data)
       setReqTotal(res.total)
     }
@@ -64,8 +89,20 @@ export default function App() {
     finally { setLoadingSessions(false) }
   }, [])
 
+  const loadModelStats = useCallback(async () => {
+    setLoadingModels(true)
+    try { setModelStats(await api.modelStats()) }
+    catch (e) { setError(String(e)) }
+    finally { setLoadingModels(false) }
+  }, [])
+
   const loadModels = useCallback(async () => {
     try { setModels(await api.models()) }
+    catch { /* non-critical */ }
+  }, [])
+
+  const loadPricing = useCallback(async () => {
+    try { setPricing(await api.pricing()) }
     catch { /* non-critical */ }
   }, [])
 
@@ -77,6 +114,7 @@ export default function App() {
     setError(null)
     try {
       await api.cleanup()
+      setLiveRows([])
       refreshAll()
     } catch (e) {
       setError(String(e))
@@ -86,32 +124,73 @@ export default function App() {
   }
 
   const refreshAll = useCallback(() => {
-    refreshRef.current++
     setError(null)
     void loadSummary()
     void loadDaily(days)
-    void loadRequests(offset, filterModel, filterSession)
+    void loadRequests(offset, filterModel, filterSession, search, toISO(since), toISO(until))
     void loadSessions()
+    void loadModelStats()
     void loadModels()
+    void loadPricing()
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [days, offset, filterModel, filterSession])
+  }, [days, offset, filterModel, filterSession, search, since, until])
 
   // initial load
   useEffect(() => { refreshAll() }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // re-fetch requests when filters/page change
+  // re-fetch requests when filters/page change (only in browse mode)
   useEffect(() => {
-    void loadRequests(offset, filterModel, filterSession)
-  }, [offset, filterModel, filterSession, loadRequests])
+    if (!live) void loadRequests(offset, filterModel, filterSession, search, toISO(since), toISO(until))
+  }, [offset, filterModel, filterSession, search, since, until, live, loadRequests])
 
   // re-fetch daily when days change
   useEffect(() => { void loadDaily(days) }, [days, loadDaily])
+
+  // live tail via Server-Sent Events — only while the Requests tab is open, so
+  // switching tabs pauses (closes) the stream and returning re-opens it.
+  useEffect(() => {
+    if (!live || tab !== 'requests') return
+    setLiveRows([])
+    const es = new EventSource(api.streamUrl())
+    es.onmessage = ev => {
+      try {
+        const row = JSON.parse(ev.data) as RequestRow
+        setLiveRows(prev => [row, ...prev].slice(0, LIVE_CAP))
+      } catch { /* ignore malformed event */ }
+    }
+    es.onerror = () => setError('Live stream disconnected (is the proxy reachable?)')
+    return () => es.close()
+  }, [live, tab])
 
   function handleSelectSession(id: string) {
     setFilterSession(id)
     setOffset(0)
     setTab('requests')
   }
+
+  function clearFilters() {
+    setFilterModel('')
+    setFilterSession('')
+    setSearch('')
+    setSince('')
+    setUntil('')
+    setOffset(0)
+  }
+  const hasFilters = Boolean(filterModel || filterSession || search || since || until)
+
+  // Wrapper setters reset pagination so a new filter starts from page 1.
+  const onSearch  = (v: string) => { setSearch(v); setOffset(0) }
+  const onSince   = (v: string) => { setSince(v); setOffset(0) }
+  const onUntil   = (v: string) => { setUntil(v); setOffset(0) }
+
+  const q = search.toLowerCase()
+  const liveFiltered = liveRows.filter(r =>
+    (!filterModel || r.model === filterModel) &&
+    (!filterSession || (r.session_id || '').includes(filterSession)) &&
+    (!q || `${r.model} ${r.session_id} ${r.endpoint} ${r.prompt_text} ${r.response_text}`.toLowerCase().includes(q)),
+  )
+  const shownRequests = live ? liveFiltered : requests
+  const shownTotal = live ? liveFiltered.length : reqTotal
 
   return (
     <div className="app">
@@ -120,7 +199,7 @@ export default function App() {
         <h1>Ollama Proxy</h1>
         <span className="badge">Metrics</span>
         <nav>
-          {(['overview', 'requests', 'sessions'] as Tab[]).map(t => (
+          {(['overview', 'requests', 'models', 'sessions'] as Tab[]).map(t => (
             <button
               key={t}
               className={tab === t ? 'active' : ''}
@@ -153,26 +232,28 @@ export default function App() {
 
         {tab === 'overview' && (
           <>
-            <SummaryCards data={summary} loading={loadingSummary} />
+            <SummaryCards data={summary} loading={loadingSummary} currency={currency} />
             <DailyChart
               data={daily}
               loading={loadingDaily}
               days={days}
               onDaysChange={d => { setDays(d) }}
+              currency={currency}
             />
             <SessionsTable
               data={sessions.slice(0, 5)}
               loading={loadingSessions}
               onSelectSession={handleSelectSession}
+              currency={currency}
             />
           </>
         )}
 
         {tab === 'requests' && (
           <RequestsTable
-            data={requests}
-            total={reqTotal}
-            loading={loadingRequests}
+            data={shownRequests}
+            total={shownTotal}
+            loading={loadingRequests && !live}
             offset={offset}
             onOffsetChange={setOffset}
             models={models}
@@ -180,7 +261,26 @@ export default function App() {
             filterSession={filterSession}
             onFilterModel={setFilterModel}
             onFilterSession={setFilterSession}
+            search={search}
+            onSearch={onSearch}
+            since={since}
+            until={until}
+            onSince={onSince}
+            onUntil={onUntil}
+            hasFilters={hasFilters}
+            onClearFilters={clearFilters}
+            currency={currency}
+            live={live}
+            onToggleLive={() => setLive(v => !v)}
+            exportHref={api.exportUrl({
+              model: filterModel, session: filterSession,
+              q: search, since: toISO(since), until: toISO(until),
+            })}
           />
+        )}
+
+        {tab === 'models' && (
+          <ModelsTable data={modelStats} loading={loadingModels} currency={currency} />
         )}
 
         {tab === 'sessions' && (
@@ -188,6 +288,7 @@ export default function App() {
             data={sessions}
             loading={loadingSessions}
             onSelectSession={handleSelectSession}
+            currency={currency}
           />
         )}
       </main>
