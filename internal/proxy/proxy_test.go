@@ -30,13 +30,32 @@ func mustURL(t *testing.T, s string) *url.URL {
 	return u
 }
 
+// newHandlerOpts builds a Handler from opts, filling in the store, logger and
+// metrics registry every test needs. It is the entry point for tests that
+// exercise an optional subsystem (cache, gate, budgets, routing).
+func newHandlerOpts(t *testing.T, opts Options) *Handler {
+	t.Helper()
+	if opts.Store == nil {
+		opts.Store = openTestDB(t)
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if opts.Metrics == nil {
+		opts.Metrics = NewMetrics(prometheus.NewRegistry())
+	}
+	return New(opts)
+}
+
 // newHandler builds a Handler with explicit upstreams/pricing/limiter/broker.
 func newHandler(t *testing.T, upstreams []*url.URL, prices *pricing.Table, limiter *ratelimit.Limiter, broker *events.Broker) *Handler {
 	t.Helper()
-	store := openTestDB(t)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := prometheus.NewRegistry()
-	return New(upstreams, store, logger, NewMetrics(reg), prices, broker, limiter)
+	return newHandlerOpts(t, Options{
+		Upstreams: upstreams,
+		Prices:    prices,
+		Events:    broker,
+		Limiter:   limiter,
+	})
 }
 
 func openTestDB(t *testing.T) *db.Store {
@@ -55,11 +74,7 @@ func newTestHandler(t *testing.T, upstreamURL string) *Handler {
 	if err != nil {
 		t.Fatalf("parse upstream url: %v", err)
 	}
-	store := openTestDB(t)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := prometheus.NewRegistry()
-	metrics := NewMetrics(reg)
-	return New([]*url.URL{u}, store, logger, metrics, nil, nil, nil)
+	return newHandlerOpts(t, Options{Upstreams: []*url.URL{u}})
 }
 
 func TestServeHTTP_NonStream_ProxiesBody(t *testing.T) {

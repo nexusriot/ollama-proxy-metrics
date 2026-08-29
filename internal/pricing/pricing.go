@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // ModelRate is the price per 1,000 tokens for one model.
@@ -53,12 +54,31 @@ func Load(path string) (*Table, error) {
 	return &t, nil
 }
 
-// rateFor returns the rate for model, falling back to Default.
+// rateFor returns the rate for model, falling back first to the same model
+// without its tag and then to Default. The untagged fallback is what lets a
+// table written as "llama3" keep pricing requests recorded as "llama3:latest",
+// while a table that prices "llama3:70b" separately still wins on exact match.
 func (t *Table) rateFor(model string) ModelRate {
 	if r, ok := t.Models[model]; ok {
 		return r
 	}
+	if base, ok := untagged(model); ok {
+		if r, ok := t.Models[base]; ok {
+			return r
+		}
+	}
 	return t.Default
+}
+
+// untagged strips a trailing ":tag" from a model name, ignoring a colon that
+// belongs to a registry host and port ("registry:5000/ns/model").
+func untagged(model string) (string, bool) {
+	slash := strings.LastIndex(model, "/")
+	colon := strings.LastIndex(model, ":")
+	if colon <= slash {
+		return "", false
+	}
+	return model[:colon], true
 }
 
 // Cost returns the estimated cost for the given token counts under model's rate.

@@ -33,13 +33,16 @@ CREATE TABLE IF NOT EXISTS requests (
     client_ip         TEXT    NOT NULL DEFAULT '',
     user_agent        TEXT    NOT NULL DEFAULT '',
     prompt_text       TEXT    NOT NULL DEFAULT '',
-    response_text     TEXT    NOT NULL DEFAULT ''
+    response_text     TEXT    NOT NULL DEFAULT '',
+    tokens_estimated  INTEGER NOT NULL DEFAULT 0,
+    cached            INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp  ON requests(timestamp);
 CREATE INDEX IF NOT EXISTS idx_requests_session_id ON requests(session_id);
 CREATE INDEX IF NOT EXISTS idx_requests_model      ON requests(model);
 CREATE INDEX IF NOT EXISTS idx_requests_date       ON requests(substr(timestamp,1,10));
+CREATE INDEX IF NOT EXISTS idx_requests_status     ON requests(status_code);
 `
 
 // migrations are additive, idempotent ALTERs applied on every Open so that
@@ -50,6 +53,8 @@ var migrations = []string{
 	`ALTER TABLE requests ADD COLUMN cost          REAL   NOT NULL DEFAULT 0`,
 	`ALTER TABLE requests ADD COLUMN prompt_text   TEXT   NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN response_text TEXT   NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN tokens_estimated INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE requests ADD COLUMN cached           INTEGER NOT NULL DEFAULT 0`,
 }
 
 // Store wraps a SQLite database connection.
@@ -102,6 +107,8 @@ type RequestRecord struct {
 	UserAgent        string
 	PromptText       string
 	ResponseText     string
+	TokensEstimated  bool
+	Cached           bool
 }
 
 // InsertRequest persists a RequestRecord.
@@ -112,8 +119,8 @@ func (s *Store) InsertRequest(r RequestRecord) error {
 			status_code, duration_ms, ttft_ms, request_bytes, response_bytes,
 			prompt_tokens, completion_tokens, total_tokens, cost,
 			error_message, client_ip, user_agent,
-			prompt_text, response_text
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			prompt_text, response_text, tokens_estimated, cached
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.RequestID,
 		r.SessionID,
 		r.Timestamp.UTC().Format(time.RFC3339Nano),
@@ -135,6 +142,8 @@ func (s *Store) InsertRequest(r RequestRecord) error {
 		r.UserAgent,
 		r.PromptText,
 		r.ResponseText,
+		boolToInt(r.TokensEstimated),
+		boolToInt(r.Cached),
 	)
 	return err
 }
@@ -163,6 +172,8 @@ type RequestRow struct {
 	UserAgent        string    `json:"user_agent"`
 	PromptText       string    `json:"prompt_text"`
 	ResponseText     string    `json:"response_text"`
+	TokensEstimated  bool      `json:"tokens_estimated"`
+	Cached           bool      `json:"cached"`
 }
 
 // selectColumns is the canonical column list for reading full request rows.
@@ -171,26 +182,28 @@ const selectColumns = `
 	status_code, duration_ms, ttft_ms, request_bytes, response_bytes,
 	prompt_tokens, completion_tokens, total_tokens, cost,
 	error_message, client_ip, user_agent,
-	prompt_text, response_text`
+	prompt_text, response_text, tokens_estimated, cached`
 
 // scanRow scans one full request row from a *sql.Rows positioned at a record.
 func scanRow(dbRows *sql.Rows) (RequestRow, error) {
 	var r RequestRow
 	var tsStr string
-	var streamInt int
+	var streamInt, estimatedInt, cachedInt int
 	err := dbRows.Scan(
 		&r.ID, &r.RequestID, &r.SessionID, &tsStr,
 		&r.Endpoint, &r.Method, &r.Model, &streamInt,
 		&r.StatusCode, &r.DurationMS, &r.TTFTMs, &r.RequestBytes, &r.ResponseBytes,
 		&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.Cost,
 		&r.ErrorMessage, &r.ClientIP, &r.UserAgent,
-		&r.PromptText, &r.ResponseText,
+		&r.PromptText, &r.ResponseText, &estimatedInt, &cachedInt,
 	)
 	if err != nil {
 		return r, err
 	}
 	r.Timestamp, _ = time.Parse(time.RFC3339Nano, tsStr)
 	r.Stream = streamInt != 0
+	r.TokensEstimated = estimatedInt != 0
+	r.Cached = cachedInt != 0
 	return r, nil
 }
 
@@ -202,6 +215,11 @@ type RequestFilter struct {
 	Query   string // case-insensitive substring across endpoint/model/session/prompt/response
 	Since   string // inclusive lower bound on timestamp (RFC3339; lexical == chronological)
 	Until   string // inclusive upper bound on timestamp (RFC3339)
+	Status  int    // exact status_code match; 0 means any
+	// ErrorsOnly keeps just the failures: rows that recorded an error message or
+	// answered with a 4xx/5xx. Both are needed — a rate-limited request has a
+	// status and a message, a client disconnect mid-stream has only a message.
+	ErrorsOnly bool
 }
 
 // filterClause builds a parameterized WHERE clause from a RequestFilter.
@@ -227,6 +245,13 @@ func filterClause(f RequestFilter) (where string, args []interface{}) {
 	if f.Until != "" {
 		conds = append(conds, "timestamp <= ?")
 		args = append(args, f.Until)
+	}
+	if f.Status != 0 {
+		conds = append(conds, "status_code = ?")
+		args = append(args, f.Status)
+	}
+	if f.ErrorsOnly {
+		conds = append(conds, "(error_message != '' OR status_code >= 400)")
 	}
 	return strings.Join(conds, " AND "), args
 }
@@ -535,6 +560,87 @@ func (s *Store) Models() ([]string, error) {
 		out = []string{}
 	}
 	return out, rows.Err()
+}
+
+// StatusCount is the number of requests recorded under one HTTP status code.
+type StatusCount struct {
+	StatusCode int   `json:"status_code"`
+	Count      int64 `json:"count"`
+}
+
+// StatusCounts returns the status-code distribution for the rows matching f,
+// commonest first. It backs the dashboard's status facet, so callers pass a
+// filter with the status/errors selection cleared — otherwise selecting one
+// code would zero out every other chip.
+func (s *Store) StatusCounts(f RequestFilter) ([]StatusCount, error) {
+	where, args := filterClause(f)
+	rows, err := s.db.Query(`
+		SELECT status_code, COUNT(*) AS count
+		FROM requests WHERE `+where+`
+		GROUP BY status_code
+		ORDER BY count DESC, status_code ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []StatusCount
+	for rows.Next() {
+		var c StatusCount
+		if err := rows.Scan(&c.StatusCode, &c.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SessionUsage is one session's consumption over a time window.
+type SessionUsage struct {
+	SessionID string  `json:"session_id"`
+	Tokens    int64   `json:"tokens"`
+	Cost      float64 `json:"cost"`
+}
+
+// UsageSince returns per-session token and cost totals for rows at or after the
+// given RFC3339 timestamp. It seeds the in-memory budget tracker at startup so a
+// restart resumes the day's accounting instead of resetting it.
+func (s *Store) UsageSince(since string) ([]SessionUsage, error) {
+	rows, err := s.db.Query(`
+		SELECT session_id,
+		       COALESCE(SUM(total_tokens),0),
+		       COALESCE(SUM(cost),0.0)
+		FROM requests
+		WHERE session_id != '' AND timestamp >= ?
+		GROUP BY session_id`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SessionUsage
+	for rows.Next() {
+		var u SessionUsage
+		if err := rows.Scan(&u.SessionID, &u.Tokens, &u.Cost); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// RenameModel rewrites every row recorded under from so it reads as to, and
+// reports how many rows changed. It backs the one-shot normalization backfill
+// that folds historical "llama3" rows into "llama3:latest".
+func (s *Store) RenameModel(from, to string) (int64, error) {
+	if from == "" || from == to {
+		return 0, nil
+	}
+	res, err := s.db.Exec(`UPDATE requests SET model = ? WHERE model = ?`, to, from)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // DeleteAll removes every row from the requests table and reclaims space.

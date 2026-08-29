@@ -481,3 +481,226 @@ func TestModels_ReturnsDistinct(t *testing.T) {
 		t.Errorf("expected 2 distinct models, got %v", models)
 	}
 }
+
+func TestInsertRequest_RoundTripsEstimatedAndCachedFlags(t *testing.T) {
+	s := openTestDB(t)
+
+	plain := sampleRecord("plain")
+	estimated := sampleRecord("estimated")
+	estimated.TokensEstimated = true
+	cached := sampleRecord("cached")
+	cached.Cached = true
+
+	for _, r := range []RequestRecord{plain, estimated, cached} {
+		if err := s.InsertRequest(r); err != nil {
+			t.Fatalf("InsertRequest(%s): %v", r.RequestID, err)
+		}
+	}
+
+	rows, _, err := s.ListRequestsFiltered(10, 0, RequestFilter{})
+	if err != nil {
+		t.Fatalf("ListRequestsFiltered: %v", err)
+	}
+	got := map[string]RequestRow{}
+	for _, r := range rows {
+		got[r.RequestID] = r
+	}
+	if got["plain"].TokensEstimated || got["plain"].Cached {
+		t.Errorf("plain row = %+v, want both flags false", got["plain"])
+	}
+	if !got["estimated"].TokensEstimated || got["estimated"].Cached {
+		t.Errorf("estimated row = %+v, want only TokensEstimated", got["estimated"])
+	}
+	if !got["cached"].Cached || got["cached"].TokensEstimated {
+		t.Errorf("cached row = %+v, want only Cached", got["cached"])
+	}
+}
+
+// errorFixtures inserts one healthy row plus three failures of different shapes.
+func errorFixtures(t *testing.T) *Store {
+	t.Helper()
+	s := openTestDB(t)
+
+	ok := sampleRecord("ok")
+
+	notFound := sampleRecord("not-found")
+	notFound.StatusCode = 404
+
+	upstream := sampleRecord("upstream")
+	upstream.StatusCode = 502
+	upstream.ErrorMessage = "upstream: connection refused"
+
+	// A client that hangs up mid-stream leaves a message but a 200 status.
+	disconnect := sampleRecord("disconnect")
+	disconnect.StatusCode = 200
+	disconnect.ErrorMessage = "write to client: broken pipe"
+
+	for _, r := range []RequestRecord{ok, notFound, upstream, disconnect} {
+		if err := s.InsertRequest(r); err != nil {
+			t.Fatalf("InsertRequest(%s): %v", r.RequestID, err)
+		}
+	}
+	return s
+}
+
+func TestListRequestsFiltered_ErrorsOnly(t *testing.T) {
+	s := errorFixtures(t)
+
+	rows, total, err := s.ListRequestsFiltered(10, 0, RequestFilter{ErrorsOnly: true})
+	if err != nil {
+		t.Fatalf("ListRequestsFiltered: %v", err)
+	}
+	if total != 3 || len(rows) != 3 {
+		t.Fatalf("errors-only total = %d (%d rows), want 3", total, len(rows))
+	}
+	for _, r := range rows {
+		if r.RequestID == "ok" {
+			t.Fatal("errors-only returned the successful row")
+		}
+	}
+}
+
+func TestListRequestsFiltered_ByStatus(t *testing.T) {
+	s := errorFixtures(t)
+
+	rows, total, err := s.ListRequestsFiltered(10, 0, RequestFilter{Status: 502})
+	if err != nil {
+		t.Fatalf("ListRequestsFiltered: %v", err)
+	}
+	if total != 1 || len(rows) != 1 || rows[0].RequestID != "upstream" {
+		t.Fatalf("status=502 returned %d rows: %+v", total, rows)
+	}
+}
+
+func TestListRequestsFiltered_StatusCombinesWithOtherFilters(t *testing.T) {
+	s := errorFixtures(t)
+
+	_, total, err := s.ListRequestsFiltered(10, 0, RequestFilter{Status: 502, Model: "nope"})
+	if err != nil {
+		t.Fatalf("ListRequestsFiltered: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("status + non-matching model returned %d rows, want 0", total)
+	}
+}
+
+func TestStatusCounts(t *testing.T) {
+	s := errorFixtures(t)
+
+	counts, err := s.StatusCounts(RequestFilter{})
+	if err != nil {
+		t.Fatalf("StatusCounts: %v", err)
+	}
+	got := map[int]int64{}
+	for _, c := range counts {
+		got[c.StatusCode] = c.Count
+	}
+	if got[200] != 2 || got[404] != 1 || got[502] != 1 {
+		t.Fatalf("StatusCounts = %v", got)
+	}
+	// Commonest first.
+	if counts[0].StatusCode != 200 {
+		t.Fatalf("StatusCounts[0] = %d, want the commonest status", counts[0].StatusCode)
+	}
+}
+
+func TestStatusCounts_HonorsOtherFilters(t *testing.T) {
+	s := errorFixtures(t)
+
+	counts, err := s.StatusCounts(RequestFilter{Model: "llama3", Session: "nobody"})
+	if err != nil {
+		t.Fatalf("StatusCounts: %v", err)
+	}
+	if len(counts) != 0 {
+		t.Fatalf("StatusCounts with a non-matching session = %v, want none", counts)
+	}
+}
+
+func TestUsageSince(t *testing.T) {
+	s := openTestDB(t)
+
+	old := sampleRecord("old")
+	old.Timestamp = time.Date(2026, 4, 14, 23, 0, 0, 0, time.UTC)
+	old.Cost = 5
+
+	today := sampleRecord("today")
+	today.Cost = 0.25
+
+	other := sampleRecord("other-session")
+	other.SessionID = "session-xyz"
+	other.TotalTokens = 10
+	other.Cost = 0.5
+
+	anon := sampleRecord("anon")
+	anon.SessionID = ""
+
+	for _, r := range []RequestRecord{old, today, other, anon} {
+		if err := s.InsertRequest(r); err != nil {
+			t.Fatalf("InsertRequest(%s): %v", r.RequestID, err)
+		}
+	}
+
+	usage, err := s.UsageSince("2026-04-15T00:00:00Z")
+	if err != nil {
+		t.Fatalf("UsageSince: %v", err)
+	}
+	got := map[string]SessionUsage{}
+	for _, u := range usage {
+		got[u.SessionID] = u
+	}
+	if len(got) != 2 {
+		t.Fatalf("UsageSince returned %d sessions: %+v", len(got), usage)
+	}
+	if got["session-abc"].Tokens != 350 || got["session-abc"].Cost != 0.25 {
+		t.Errorf("session-abc usage = %+v, want today's row only", got["session-abc"])
+	}
+	if got["session-xyz"].Tokens != 10 {
+		t.Errorf("session-xyz usage = %+v", got["session-xyz"])
+	}
+}
+
+func TestRenameModel(t *testing.T) {
+	s := openTestDB(t)
+
+	tagged := sampleRecord("tagged")
+	tagged.Model = "llama3:latest"
+	untagged := sampleRecord("untagged")
+	untagged.Model = "llama3"
+	other := sampleRecord("other")
+	other.Model = "mistral:7b"
+
+	for _, r := range []RequestRecord{tagged, untagged, other} {
+		if err := s.InsertRequest(r); err != nil {
+			t.Fatalf("InsertRequest(%s): %v", r.RequestID, err)
+		}
+	}
+
+	n, err := s.RenameModel("llama3", "llama3:latest")
+	if err != nil {
+		t.Fatalf("RenameModel: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("RenameModel affected %d rows, want 1", n)
+	}
+
+	models, err := s.Models()
+	if err != nil {
+		t.Fatalf("Models: %v", err)
+	}
+	if len(models) != 2 || models[0] != "llama3:latest" || models[1] != "mistral:7b" {
+		t.Fatalf("Models after rename = %v", models)
+	}
+}
+
+func TestRenameModel_NoopForEmptyOrIdenticalName(t *testing.T) {
+	s := openTestDB(t)
+	if err := s.InsertRequest(sampleRecord("r1")); err != nil {
+		t.Fatalf("InsertRequest: %v", err)
+	}
+	for _, c := range [][2]string{{"", "x"}, {"llama3", "llama3"}} {
+		n, err := s.RenameModel(c[0], c[1])
+		if err != nil || n != 0 {
+			t.Fatalf("RenameModel(%q,%q) = %d, %v; want 0, nil", c[0], c[1], n, err)
+		}
+	}
+}

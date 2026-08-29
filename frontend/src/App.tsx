@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   api,
   type Summary, type RequestRow, type DailyStat, type SessionStat,
-  type ModelStat, type Pricing,
+  type ModelStat, type Pricing, type StatusCount,
 } from './api'
 import { SummaryCards } from './components/SummaryCards'
 import { DailyChart } from './components/DailyChart'
@@ -32,6 +32,7 @@ export default function App() {
   const [reqTotal, setReqTotal]   = useState(0)
   const [sessions, setSessions]   = useState<SessionStat[]>([])
   const [modelStats, setModelStats] = useState<ModelStat[]>([])
+  const [statusCounts, setStatusCounts] = useState<StatusCount[]>([])
   const [models, setModels]       = useState<string[]>([])
   const [pricing, setPricing]     = useState<Pricing | null>(null)
   const [error, setError]         = useState<string | null>(null)
@@ -49,6 +50,8 @@ export default function App() {
   const [search,        setSearch]        = useState('')
   const [since,         setSince]         = useState('') // datetime-local string
   const [until,         setUntil]         = useState('')
+  const [errorsOnly,    setErrorsOnly]    = useState(false)
+  const [filterStatus,  setFilterStatus]  = useState(0)
 
   const [live, setLive]         = useState(false)
   const [liveRows, setLiveRows] = useState<RequestRow[]>([])
@@ -69,18 +72,33 @@ export default function App() {
     finally { setLoadingDaily(false) }
   }, [])
 
-  const loadRequests = useCallback(async (
-    off: number, model: string, session: string, q: string, sinceISO: string, untilISO: string,
-  ) => {
+  // requestFilters collects every filter the requests list, the status facet and
+  // the export download share, so the three can never drift apart.
+  const requestFilters = useCallback(() => ({
+    model: filterModel,
+    session: filterSession,
+    q: search,
+    since: toISO(since),
+    until: toISO(until),
+    status: filterStatus,
+    errors: errorsOnly,
+  }), [filterModel, filterSession, search, since, until, filterStatus, errorsOnly])
+
+  const loadRequests = useCallback(async (off: number) => {
     setLoadingRequests(true)
     try {
-      const res = await api.requests({ limit: PAGE, offset: off, model, session, q, since: sinceISO, until: untilISO })
+      const res = await api.requests({ limit: PAGE, offset: off, ...requestFilters() })
       setRequests(res.data)
       setReqTotal(res.total)
     }
     catch (e) { setError(String(e)) }
     finally { setLoadingRequests(false) }
-  }, [])
+  }, [requestFilters])
+
+  const loadStatusCounts = useCallback(async () => {
+    try { setStatusCounts(await api.statusCounts(requestFilters())) }
+    catch { /* non-critical: the facet just stays as it was */ }
+  }, [requestFilters])
 
   const loadSessions = useCallback(async () => {
     setLoadingSessions(true)
@@ -127,21 +145,28 @@ export default function App() {
     setError(null)
     void loadSummary()
     void loadDaily(days)
-    void loadRequests(offset, filterModel, filterSession, search, toISO(since), toISO(until))
+    void loadRequests(offset)
+    void loadStatusCounts()
     void loadSessions()
     void loadModelStats()
     void loadModels()
     void loadPricing()
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [days, offset, filterModel, filterSession, search, since, until])
+  }, [days, offset, filterModel, filterSession, search, since, until, filterStatus, errorsOnly])
 
   // initial load
   useEffect(() => { refreshAll() }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // re-fetch requests when filters/page change (only in browse mode)
   useEffect(() => {
-    if (!live) void loadRequests(offset, filterModel, filterSession, search, toISO(since), toISO(until))
-  }, [offset, filterModel, filterSession, search, since, until, live, loadRequests])
+    if (!live) void loadRequests(offset)
+  }, [offset, live, loadRequests])
+
+  // the status facet follows the other filters, but not the status selection
+  // itself — clicking a chip must not make the remaining chips disappear
+  useEffect(() => {
+    if (!live) void loadStatusCounts()
+  }, [live, loadStatusCounts])
 
   // re-fetch daily when days change
   useEffect(() => { void loadDaily(days) }, [days, loadDaily])
@@ -174,19 +199,29 @@ export default function App() {
     setSearch('')
     setSince('')
     setUntil('')
+    setErrorsOnly(false)
+    setFilterStatus(0)
     setOffset(0)
   }
-  const hasFilters = Boolean(filterModel || filterSession || search || since || until)
+  const hasFilters = Boolean(filterModel || filterSession || search || since || until || errorsOnly || filterStatus)
 
   // Wrapper setters reset pagination so a new filter starts from page 1.
   const onSearch  = (v: string) => { setSearch(v); setOffset(0) }
   const onSince   = (v: string) => { setSince(v); setOffset(0) }
   const onUntil   = (v: string) => { setUntil(v); setOffset(0) }
+  const onStatus  = (v: number) => { setFilterStatus(v); setOffset(0) }
+  const toggleErrors = () => { setErrorsOnly(v => !v); setOffset(0) }
+
+  // isFailure mirrors the server's errors-only rule so the live tail can filter
+  // client-side without a round trip.
+  const isFailure = (r: RequestRow) => Boolean(r.error_message) || r.status_code >= 400
 
   const q = search.toLowerCase()
   const liveFiltered = liveRows.filter(r =>
     (!filterModel || r.model === filterModel) &&
     (!filterSession || (r.session_id || '').includes(filterSession)) &&
+    (!filterStatus || r.status_code === filterStatus) &&
+    (!errorsOnly || isFailure(r)) &&
     (!q || `${r.model} ${r.session_id} ${r.endpoint} ${r.prompt_text} ${r.response_text}`.toLowerCase().includes(q)),
   )
   const shownRequests = live ? liveFiltered : requests
@@ -267,15 +302,17 @@ export default function App() {
             until={until}
             onSince={onSince}
             onUntil={onUntil}
+            errorsOnly={errorsOnly}
+            onToggleErrors={toggleErrors}
+            filterStatus={filterStatus}
+            onFilterStatus={onStatus}
+            statusCounts={statusCounts}
             hasFilters={hasFilters}
             onClearFilters={clearFilters}
             currency={currency}
             live={live}
             onToggleLive={() => setLive(v => !v)}
-            exportHref={api.exportUrl({
-              model: filterModel, session: filterSession,
-              q: search, since: toISO(since), until: toISO(until),
-            })}
+            exportHref={api.exportUrl(requestFilters())}
           />
         )}
 

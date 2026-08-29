@@ -342,3 +342,64 @@ tbody td { padding: 9px 14px; white-space: nowrap; }
   line-height: 1.8;
 }
 .chart-tooltip .ct-label { color: var(--muted); margin-bottom: 4px; font-size: 11px; }
+
+/* Error-focused controls: the errors-only toggle and the status facet chips. */
+.err-btn {
+  background: var(--surface);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.err-btn:hover { color: var(--text); }
+.err-on {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(239, 68, 68, .1);
+}
+
+.facets {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 18px 12px;
+}
+.facet-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+  margin-right: 2px;
+}
+.chip {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.chip:hover { border-color: var(--muted); }
+.chip-count { color: var(--muted); margin-left: 4px; }
+.chip-err { color: var(--red); }
+.chip-on {
+  border-color: currentColor;
+  background: rgba(99, 102, 241, .18);
+}
+
+.pill-cache {
+  margin-left: 4px;
+  background: rgba(251, 191, 36, .15);
+  color: var(--yellow);
+}
+
+/* Marks a token count the proxy estimated rather than read from the model. */
+.approx {
+  color: var(--muted);
+  margin-right: 2px;
+}
