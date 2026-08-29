@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { RequestRow } from '../api'
+import type { RequestRow, StatusCount } from '../api'
 import { fmtCost } from '../format'
 
 const PAGE = 50
@@ -21,6 +21,11 @@ interface Props {
   until: string
   onSince: (s: string) => void
   onUntil: (s: string) => void
+  errorsOnly: boolean
+  onToggleErrors: () => void
+  filterStatus: number
+  onFilterStatus: (s: number) => void
+  statusCounts: StatusCount[]
   hasFilters: boolean
   onClearFilters: () => void
   currency: string
@@ -79,6 +84,7 @@ export function RequestsTable({
   models, filterModel, filterSession,
   onFilterModel, onFilterSession,
   search, onSearch, since, until, onSince, onUntil,
+  errorsOnly, onToggleErrors, filterStatus, onFilterStatus, statusCounts,
   hasFilters, onClearFilters,
   currency, live, onToggleLive, exportHref,
 }: Props) {
@@ -124,6 +130,13 @@ export function RequestsTable({
           To
           <input type="datetime-local" value={until} disabled={live} onChange={e => onUntil(e.target.value)} />
         </label>
+        <button
+          className={errorsOnly ? 'err-btn err-on' : 'err-btn'}
+          onClick={onToggleErrors}
+          title="Show only requests that failed or returned 4xx/5xx"
+        >
+          ⚠ Errors only
+        </button>
         {hasFilters && (
           <button className="clear-btn" onClick={onClearFilters} title="Clear all filters">✕ clear</button>
         )}
@@ -137,6 +150,26 @@ export function RequestsTable({
         </button>
         <a className="export-btn" href={exportHref}>⤓ CSV</a>
       </div>
+
+      {statusCounts.length > 1 && (
+        <div className="facets">
+          <span className="facet-label">Status</span>
+          {statusCounts.map(c => (
+            <button
+              key={c.status_code}
+              className={[
+                'chip',
+                c.status_code >= 400 ? 'chip-err' : '',
+                filterStatus === c.status_code ? 'chip-on' : '',
+              ].filter(Boolean).join(' ')}
+              onClick={() => onFilterStatus(filterStatus === c.status_code ? 0 : c.status_code)}
+              title={`Show only ${c.status_code} responses`}
+            >
+              {c.status_code} <span className="chip-count">{c.count.toLocaleString()}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="table-wrap">
         <table>
@@ -184,6 +217,11 @@ export function RequestsTable({
                       <span className={`pill ${r.stream ? 'pill-stream' : 'pill-sync'}`}>
                         {r.stream ? 'stream' : 'sync'}
                       </span>
+                      {r.cached && (
+                        <span className="pill pill-cache" title="Served from the proxy response cache">
+                          cache
+                        </span>
+                      )}
                     </td>
                     <td>
                       <span className={`pill ${r.status_code < 400 ? 'pill-ok' : 'pill-err'}`}>
@@ -191,7 +229,11 @@ export function RequestsTable({
                       </span>
                     </td>
                     <td className="mono">{r.duration_ms}ms</td>
-                    <td className="mono">
+                    <td
+                      className="mono"
+                      title={r.tokens_estimated ? 'Estimated from text: the upstream reported no token counts' : undefined}
+                    >
+                      {r.tokens_estimated && <span className="approx">≈</span>}
                       {r.prompt_tokens.toLocaleString()} + {r.completion_tokens.toLocaleString()}
                       {' '}
                       <span style={{ color: 'var(--muted)' }}>= {r.total_tokens.toLocaleString()}</span>
@@ -239,6 +281,8 @@ export function RequestsTable({
                           <div><span style={{ color: 'var(--muted)' }}>Throughput </span>{tokensPerSec(r) > 0 ? `${tokensPerSec(r).toFixed(1)} tok/s` : '—'}</div>
                           <div><span style={{ color: 'var(--muted)' }}>Cost </span>{r.cost > 0 ? fmtCost(r.cost, currency) : '—'}</div>
                           <div><span style={{ color: 'var(--muted)' }}>Session </span><span className="mono" style={{ fontSize: 11 }}>{r.session_id || '—'}</span></div>
+                          <div><span style={{ color: 'var(--muted)' }}>Tokens </span>{r.tokens_estimated ? 'estimated from text' : 'reported by the model'}</div>
+                          <div><span style={{ color: 'var(--muted)' }}>Cache </span>{r.cached ? 'served from cache' : 'generated upstream'}</div>
                           <div style={{ gridColumn: '1 / -1' }}><span style={{ color: 'var(--muted)' }}>User-Agent </span>{r.user_agent || '—'}</div>
                           {r.error_message && (
                             <div style={{ gridColumn: '1 / -1', color: 'var(--red)' }}>

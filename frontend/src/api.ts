@@ -35,6 +35,8 @@ export interface RequestRow {
   user_agent: string
   prompt_text: string
   response_text: string
+  tokens_estimated: boolean
+  cached: boolean
 }
 
 export interface RequestsResponse {
@@ -82,6 +84,11 @@ export interface ModelStat {
   last_seen: string
 }
 
+export interface StatusCount {
+  status_code: number
+  count: number
+}
+
 export interface ModelRate {
   prompt_per_1k: number
   completion_per_1k: number
@@ -113,6 +120,8 @@ export interface RequestParams {
   q?: string
   since?: string
   until?: string
+  status?: number
+  errors?: boolean
 }
 
 function requestsQuery(params: RequestParams): URLSearchParams {
@@ -124,6 +133,8 @@ function requestsQuery(params: RequestParams): URLSearchParams {
   if (params.q)       q.set('q',       params.q)
   if (params.since)   q.set('since',   params.since)
   if (params.until)   q.set('until',   params.until)
+  if (params.status)  q.set('status',  String(params.status))
+  if (params.errors)  q.set('errors',  'true')
   return q
 }
 
@@ -135,6 +146,12 @@ export const api = {
   models:     ()           => get<string[]>('/models'),
   modelStats: ()           => get<ModelStat[]>('/model-stats'),
   pricing:    ()           => get<Pricing>('/pricing'),
+
+  // Status-code facet for the current filters. The status/errors selection is
+  // dropped server-side so the chips keep showing the codes you filtered out.
+  statusCounts: (params: RequestParams) =>
+    get<StatusCount[]>(`/status-counts?${requestsQuery({ ...params, status: undefined, errors: false })}`),
+
   requests:   (params: RequestParams) =>
     get<RequestsResponse>(`/requests?${requestsQuery(params)}`),
 

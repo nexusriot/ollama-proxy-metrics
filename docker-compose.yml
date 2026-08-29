@@ -31,12 +31,31 @@ services:
       LOG_MAX_MB:      "${LOG_MAX_MB:-50}"        # rotate proxy.log past this size
       LOG_MAX_BACKUPS: "${LOG_MAX_BACKUPS:-5}"
       PRICING_PATH:    "${PRICING_PATH:-}"        # e.g. /data/pricing.json (see pricing.example.json)
+      MAX_BODY_MB:     "${MAX_BODY_MB:-32}"       # reject bodies larger than this; 0 = no cap
+      MAX_CONCURRENT:  "${MAX_CONCURRENT:-0}"     # requests forwarded at once; 0 = no queueing
+      MAX_QUEUE:       "${MAX_QUEUE:-0}"          # waiters before 503; 0 = unbounded
+      CACHE_TTL:       "${CACHE_TTL:-}"           # e.g. 10m; empty disables the response cache
+      CACHE_MAX_MB:    "${CACHE_MAX_MB:-64}"
+      BUDGET_TOKENS_PER_DAY: "${BUDGET_TOKENS_PER_DAY:-0}"  # per-session/day; 0 = unlimited
+      BUDGET_COST_PER_DAY:   "${BUDGET_COST_PER_DAY:-0}"    # needs a pricing table
+      UPSTREAM_POLL:   "${UPSTREAM_POLL:-30s}"    # model-inventory poll; 0 disables routing
+      CIRCUIT_FAILURES: "${CIRCUIT_FAILURES:-3}"
+      CIRCUIT_COOLDOWN: "${CIRCUIT_COOLDOWN:-30s}"
+      RETRY_5XX:       "${RETRY_5XX:-true}"
+      NORMALIZE_MODELS: "${NORMALIZE_MODELS:-true}"
+      MODEL_ALIASES:   "${MODEL_ALIASES:-}"       # alias=target,…
+      NORMALIZE_BACKFILL: "${NORMALIZE_BACKFILL:-false}"
+      INJECT_USAGE:    "${INJECT_USAGE:-true}"
+      ESTIMATE_TOKENS: "${ESTIMATE_TOKENS:-false}"
+      SHUTDOWN_GRACE:  "${SHUTDOWN_GRACE:-30s}"
     volumes:
       - ./data:/data              # persistent SQLite DB + logs
 #      - ./pricing.example.json:/data/pricing.json:ro   # then set PRICING_PATH=/data/pricing.json
 #    depends_on:
 #      - ollama
     restart: unless-stopped
+    # Give in-flight generations time to finish before the container is killed.
+    stop_grace_period: 40s
     healthcheck:
       test:     ["CMD", "wget", "-qO-", "http://localhost:8080/metrics"]
       interval: 15s

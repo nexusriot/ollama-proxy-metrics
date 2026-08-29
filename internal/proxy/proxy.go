@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,16 +18,31 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/nexusriot/ollama-proxy-metrics/internal/budget"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/cache"
 	"github.com/nexusriot/ollama-proxy-metrics/internal/db"
 	"github.com/nexusriot/ollama-proxy-metrics/internal/events"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/gate"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/modelname"
 	"github.com/nexusriot/ollama-proxy-metrics/internal/pricing"
 	"github.com/nexusriot/ollama-proxy-metrics/internal/ratelimit"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/tokens"
+	"github.com/nexusriot/ollama-proxy-metrics/internal/upstream"
 )
+
+// StatusClientClosed is the non-standard status nginx uses for "the client hung
+// up before the response was ready". Nothing is sent to the client — it exists
+// so an abandoned request is recorded as abandoned rather than as a success.
+const StatusClientClosed = 499
+
+// drainLimit is how much of a discarded upstream response is read before the
+// connection is returned to the pool. Reading a little keeps the connection
+// reusable; reading all of a large error page would waste time on a failover.
+const drainLimit = 64 << 10
 
 // requestPayload is the minimal incoming JSON shape we care about. The fields
 // overlap across Ollama native and OpenAI-compatible requests.
@@ -151,6 +167,18 @@ type Metrics struct {
 	TokensOut   *prometheus.CounterVec
 	CostTotal   *prometheus.CounterVec
 	RateLimited prometheus.Counter
+
+	EstimatedTokens  *prometheus.CounterVec
+	BudgetDenied     *prometheus.CounterVec
+	Inflight         prometheus.Gauge
+	QueueWait        prometheus.Histogram
+	QueueRejected    prometheus.Counter
+	CacheHits        *prometheus.CounterVec
+	CacheMisses      *prometheus.CounterVec
+	CacheSavedTokens *prometheus.CounterVec
+	UpstreamUp       *prometheus.GaugeVec
+	UpstreamRequests *prometheus.CounterVec
+	Retries          *prometheus.CounterVec
 }
 
 // NewMetrics creates and registers a fresh set of Prometheus metrics using reg.
@@ -202,18 +230,90 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "ollama_proxy_rate_limited_total",
 			Help: "Total requests rejected by the per-session rate limiter.",
 		}),
+
+		// Estimated tokens are kept out of the prompt/completion counters on
+		// purpose: those are sourced from the model's own eval stats and stay
+		// exact, so a dashboard can show measured and guessed side by side.
+		EstimatedTokens: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ollama_proxy_estimated_tokens_total",
+			Help: "Total tokens estimated from text when the upstream reported none.",
+		}, []string{"endpoint", "model", "kind"}),
+
+		BudgetDenied: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ollama_proxy_budget_denied_total",
+			Help: "Total requests refused because a session exhausted its daily budget.",
+		}, []string{"reason"}),
+
+		Inflight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "ollama_proxy_inflight_requests",
+			Help: "Requests currently being proxied.",
+		}),
+
+		QueueWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "ollama_proxy_queue_wait_seconds",
+			Help:    "Time spent waiting for a concurrency slot before forwarding.",
+			Buckets: prometheus.DefBuckets,
+		}),
+
+		QueueRejected: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ollama_proxy_queue_rejected_total",
+			Help: "Total requests refused because the concurrency queue was full.",
+		}),
+
+		CacheHits: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ollama_proxy_cache_hits_total",
+			Help: "Total responses served from the proxy response cache.",
+		}, []string{"endpoint", "model"}),
+
+		CacheMisses: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ollama_proxy_cache_misses_total",
+			Help: "Total cacheable requests that had to be forwarded upstream.",
+		}, []string{"endpoint", "model"}),
+
+		CacheSavedTokens: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ollama_proxy_cache_saved_tokens_total",
+			Help: "Total tokens not regenerated thanks to a cache hit.",
+		}, []string{"endpoint", "model"}),
+
+		UpstreamUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "ollama_proxy_upstream_up",
+			Help: "1 when an upstream answered its last inventory poll, 0 otherwise.",
+		}, []string{"upstream"}),
+
+		UpstreamRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ollama_proxy_upstream_requests_total",
+			Help: "Total requests forwarded, by upstream and response status.",
+		}, []string{"upstream", "status"}),
+
+		Retries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ollama_proxy_upstream_retries_total",
+			Help: "Total forwarding attempts retried on another upstream.",
+		}, []string{"reason"}),
 	}
 	reg.MustRegister(
 		m.ReqTotal, m.ReqDuration, m.TTFT, m.BytesIn, m.BytesOut,
 		m.TokensIn, m.TokensOut, m.CostTotal, m.RateLimited,
+		m.EstimatedTokens, m.BudgetDenied, m.Inflight, m.QueueWait, m.QueueRejected,
+		m.CacheHits, m.CacheMisses, m.CacheSavedTokens,
+		m.UpstreamUp, m.UpstreamRequests, m.Retries,
 	)
 	return m
 }
 
+// ObserveUpstreams mirrors a pool snapshot into the upstream health gauge.
+func (m *Metrics) ObserveUpstreams(states []upstream.State) {
+	for _, s := range states {
+		up := 0.0
+		if s.Up {
+			up = 1
+		}
+		m.UpstreamUp.WithLabelValues(s.URL).Set(up)
+	}
+}
+
 // Handler is the proxy HTTP handler.
 type Handler struct {
-	upstreams  []*url.URL
-	rr         atomic.Uint64 // round-robin cursor
+	pool       *upstream.Pool
 	httpClient *http.Client
 	store      *db.Store
 	logger     *slog.Logger
@@ -221,34 +321,84 @@ type Handler struct {
 	prices     *pricing.Table
 	events     *events.Broker
 	limiter    *ratelimit.Limiter
+	budgets    *budget.Tracker
+	gate       *gate.Gate
+	cache      *cache.Cache
+
+	maxBodyBytes    int64
+	normalizeModels bool
+	modelAliases    map[string]string
+	injectUsage     bool
+	estimateTokens  bool
+	retryStatus     bool
 }
 
-// New creates a new proxy Handler. upstreams must contain at least one URL;
-// requests are round-robined across them with failover on transport errors.
-// prices, broker and limiter may be nil (cost 0, no live events, no limiting).
-func New(
-	upstreams []*url.URL,
-	store *db.Store,
-	logger *slog.Logger,
-	metrics *Metrics,
-	prices *pricing.Table,
-	broker *events.Broker,
-	limiter *ratelimit.Limiter,
-) *Handler {
+// Options configures a proxy Handler. Only Store, Logger, Metrics and one of
+// Upstreams/Pool are required; every other field is optional and disables the
+// corresponding feature when left at its zero value.
+type Options struct {
+	// Upstreams are the Ollama base URLs. Ignored when Pool is set.
+	Upstreams []*url.URL
+	// Pool orders the upstreams per request and tracks their health. When nil,
+	// one is built from Upstreams with health polling disabled.
+	Pool *upstream.Pool
+
+	Store   *db.Store
+	Logger  *slog.Logger
+	Metrics *Metrics
+	Prices  *pricing.Table
+	Events  *events.Broker
+	Limiter *ratelimit.Limiter
+	Budgets *budget.Tracker
+	Gate    *gate.Gate
+	Cache   *cache.Cache
+
+	// MaxBodyBytes caps the request body the proxy will buffer. 0 is unlimited.
+	MaxBodyBytes int64
+	// NormalizeModels folds "llama3" into "llama3:latest" before recording.
+	NormalizeModels bool
+	// ModelAliases renames models before recording; requires NormalizeModels.
+	ModelAliases map[string]string
+	// InjectUsage asks OpenAI-compatible streams to report their token usage.
+	InjectUsage bool
+	// EstimateTokens fills in token counts from text when the upstream reports none.
+	EstimateTokens bool
+	// RetryStatus retries a 5xx response on the next upstream.
+	RetryStatus bool
+}
+
+// New creates a new proxy Handler from opts.
+func New(opts Options) *Handler {
+	pool := opts.Pool
+	if pool == nil {
+		pool = upstream.New(upstream.Options{URLs: opts.Upstreams, Logger: opts.Logger})
+	}
 	return &Handler{
-		upstreams: upstreams,
+		pool: pool,
 		httpClient: &http.Client{
 			// No overall timeout – long/streaming requests need an open connection.
 			Timeout: 0,
 		},
-		store:   store,
-		logger:  logger,
-		metrics: metrics,
-		prices:  prices,
-		events:  broker,
-		limiter: limiter,
+		store:           opts.Store,
+		logger:          opts.Logger,
+		metrics:         opts.Metrics,
+		prices:          opts.Prices,
+		events:          opts.Events,
+		limiter:         opts.Limiter,
+		budgets:         opts.Budgets,
+		gate:            opts.Gate,
+		cache:           opts.Cache,
+		maxBodyBytes:    opts.MaxBodyBytes,
+		normalizeModels: opts.NormalizeModels,
+		modelAliases:    opts.ModelAliases,
+		injectUsage:     opts.InjectUsage,
+		estimateTokens:  opts.EstimateTokens,
+		retryStatus:     opts.RetryStatus,
 	}
 }
+
+// Pool exposes the upstream pool backing this handler.
+func (h *Handler) Pool() *upstream.Pool { return h.pool }
 
 // reqCtx carries the per-request context shared between the stream and
 // non-stream response handlers.
@@ -264,6 +414,7 @@ type reqCtx struct {
 	reqBytes    int64
 	isOpenAI    bool
 	start       time.Time
+	cacheKey    string
 }
 
 // ServeHTTP implements http.Handler; proxies /api/* and /v1/* to an upstream.
@@ -273,6 +424,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sessionID := extractSessionID(r)
 	clientIP := extractClientIP(r)
 	endpoint := r.URL.Path
+
+	h.metrics.Inflight.Inc()
+	defer h.metrics.Inflight.Dec()
 
 	// Per-session rate limiting (optional).
 	if h.limiter.Enabled() && !h.limiter.Allow(sessionID) {
@@ -284,17 +438,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var bodyBuf []byte
-	if r.Body != nil {
-		defer r.Body.Close()
-		var err error
-		bodyBuf, err = io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "failed to read request body", http.StatusBadRequest)
-			h.recordError(reqID, sessionID, endpoint, r, start, clientIP,
-				http.StatusBadRequest, int64(len(bodyBuf)), 0, "read body: "+err.Error())
-			return
+	// Daily token/cost budget (optional). Checked before the body is read: an
+	// exhausted session should not get to spend memory either.
+	if ok, reason := h.budgets.Check(sessionID); !ok {
+		h.metrics.BudgetDenied.WithLabelValues(string(reason)).Inc()
+		retryAfter := h.budgets.RetryAfter()
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+		http.Error(w, "daily budget exceeded for session: "+string(reason), http.StatusTooManyRequests)
+		h.recordError(reqID, sessionID, endpoint, r, start, clientIP,
+			http.StatusTooManyRequests, 0, 0, "budget exceeded: "+string(reason))
+		return
+	}
+
+	bodyBuf, err := h.readBody(w, r)
+	if err != nil {
+		status := http.StatusBadRequest
+		msg := "read body: " + err.Error()
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status = http.StatusRequestEntityTooLarge
+			msg = fmt.Sprintf("request body exceeds the %d byte limit", h.maxBodyBytes)
 		}
+		http.Error(w, msg, status)
+		h.recordError(reqID, sessionID, endpoint, r, start, clientIP,
+			status, int64(len(bodyBuf)), 0, msg)
+		return
 	}
 
 	var payload requestPayload
@@ -302,16 +470,52 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	isOpenAI := strings.HasPrefix(endpoint, "/v1/")
 	promptText := extractPromptText(payload)
-	model := payload.Model
-	if model == "" {
-		model = "unknown"
-	}
+	model := h.resolveModel(payload.Model)
 	stream := determineStream(r.Method, endpoint, isOpenAI, payload.Stream)
 	streamLabel := strconv.FormatBool(stream)
 
 	h.metrics.BytesIn.WithLabelValues(endpoint, model, streamLabel).Add(float64(len(bodyBuf)))
 
-	resp, err := h.forward(r, endpoint, bodyBuf)
+	rc := reqCtx{
+		reqID:       reqID,
+		sessionID:   sessionID,
+		clientIP:    clientIP,
+		endpoint:    endpoint,
+		method:      r.Method,
+		model:       model,
+		promptText:  promptText,
+		streamLabel: streamLabel,
+		reqBytes:    int64(len(bodyBuf)),
+		isOpenAI:    isOpenAI,
+		start:       start,
+	}
+
+	// Cache lookup happens before the concurrency gate: a hit costs no upstream
+	// work, so it has no business queueing behind requests that do.
+	if h.cacheable(r.Method, endpoint, stream) {
+		rc.cacheKey = cache.Key(endpoint, r.Method, string(bodyBuf))
+		if entry, ok := h.cache.Get(rc.cacheKey); ok {
+			h.metrics.CacheHits.WithLabelValues(endpoint, model).Inc()
+			h.serveFromCache(w, r, rc, entry)
+			return
+		}
+		h.metrics.CacheMisses.WithLabelValues(endpoint, model).Inc()
+	}
+
+	if r.Method == http.MethodPost && h.gate.Enabled() {
+		release, err := h.acquireSlot(w, r, rc)
+		if err != nil {
+			return
+		}
+		defer release()
+	}
+
+	forwardBody := bodyBuf
+	if h.injectUsage && isOpenAI && stream {
+		forwardBody = injectStreamUsage(bodyBuf)
+	}
+
+	resp, err := h.forward(r, endpoint, model, forwardBody)
 	if err != nil {
 		statusCode := http.StatusBadGateway
 		h.metrics.ReqTotal.WithLabelValues(endpoint, model, strconv.Itoa(statusCode), streamLabel).Inc()
@@ -329,21 +533,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-
-	rc := reqCtx{
-		reqID:       reqID,
-		sessionID:   sessionID,
-		clientIP:    clientIP,
-		endpoint:    endpoint,
-		method:      r.Method,
-		model:       model,
-		promptText:  promptText,
-		streamLabel: streamLabel,
-		reqBytes:    int64(len(bodyBuf)),
-		isOpenAI:    isOpenAI,
-		start:       start,
+	if rc.cacheKey != "" {
+		w.Header().Set("X-Proxy-Cache", "miss")
 	}
+	w.WriteHeader(resp.StatusCode)
 
 	if stream {
 		h.serveStream(w, resp, r, rc)
@@ -352,47 +545,218 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// forward sends the buffered request to an upstream, round-robining across the
-// configured upstreams and failing over to the next on a transport error.
-func (h *Handler) forward(r *http.Request, endpoint string, body []byte) (*http.Response, error) {
-	n := len(h.upstreams)
-	start := int(h.rr.Add(1)-1) % n
-	var lastErr error
-	for i := 0; i < n; i++ {
-		up := *h.upstreams[(start+i)%n]
-		up.Path = strings.TrimRight(up.Path, "/") + endpoint
-		up.RawQuery = r.URL.RawQuery
+// readBody buffers the request body, enforcing the configured size cap. The body
+// must be buffered because it is both parsed for metadata and replayed to the
+// upstream (possibly more than once, on failover).
+func (h *Handler) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	defer r.Body.Close()
+	body := r.Body
+	if h.maxBodyBytes > 0 {
+		body = http.MaxBytesReader(w, body, h.maxBodyBytes)
+	}
+	return io.ReadAll(body)
+}
 
-		upReq, err := http.NewRequestWithContext(r.Context(), r.Method, up.String(), bytes.NewReader(body))
+// resolveModel returns the name a request should be recorded and routed under.
+func (h *Handler) resolveModel(model string) string {
+	if model == "" {
+		return modelname.Unknown
+	}
+	if h.normalizeModels {
+		return modelname.Normalize(model, h.modelAliases)
+	}
+	return model
+}
+
+// cacheable reports whether this request is a candidate for the response cache.
+// Only non-streaming POSTs qualify: a stream has no single body to replay.
+func (h *Handler) cacheable(method, endpoint string, stream bool) bool {
+	return h.cache.Enabled() && method == http.MethodPost && !stream &&
+		!strings.HasSuffix(endpoint, "/api/tags")
+}
+
+// acquireSlot waits for a concurrency slot, answering the client itself when the
+// queue is full or the client goes away. A non-nil error means the request is
+// already finished and the caller must return.
+func (h *Handler) acquireSlot(w http.ResponseWriter, r *http.Request, rc reqCtx) (func(), error) {
+	waitStart := time.Now()
+	release, err := h.gate.Acquire(r.Context())
+	wait := time.Since(waitStart)
+
+	switch {
+	case err == nil:
+		h.metrics.QueueWait.Observe(wait.Seconds())
+		return release, nil
+
+	case errors.Is(err, gate.ErrQueueFull):
+		h.metrics.QueueRejected.Inc()
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "proxy is at capacity, retry shortly", http.StatusServiceUnavailable)
+		h.recordError(rc.reqID, rc.sessionID, rc.endpoint, r, rc.start, rc.clientIP,
+			http.StatusServiceUnavailable, rc.reqBytes, 0, "concurrency queue full")
+		return nil, err
+
+	default:
+		// The client hung up while queued: nothing to write, but the abandoned
+		// request is still worth recording.
+		h.recordError(rc.reqID, rc.sessionID, rc.endpoint, r, rc.start, rc.clientIP,
+			StatusClientClosed, rc.reqBytes, 0, "client cancelled while queued: "+err.Error())
+		return nil, err
+	}
+}
+
+// serveFromCache replays a stored response to the client and records the request
+// as a cache hit. No upstream work happened, so the tokens it would have cost are
+// reported as saved rather than spent.
+func (h *Handler) serveFromCache(w http.ResponseWriter, r *http.Request, rc reqCtx, entry *cache.Entry) {
+	for k, vals := range entry.Header {
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
+	w.Header().Set("X-Proxy-Cache", "hit")
+	w.WriteHeader(entry.Status)
+	h.completeNonStream(w, r, rc, entry.Status, entry.Body, "", true)
+}
+
+// forward sends the buffered request to an upstream, walking the pool's ordered
+// candidate list. It moves on to the next upstream when one cannot be reached,
+// when it answers 5xx, or when it answers 404 for a model another upstream is
+// known to serve.
+func (h *Handler) forward(r *http.Request, endpoint, model string, body []byte) (*http.Response, error) {
+	candidates := h.pool.Pick(model)
+	if len(candidates) == 0 {
+		return nil, errors.New("no upstreams configured")
+	}
+
+	var lastErr error
+	for i, base := range candidates {
+		last := i == len(candidates)-1
+
+		upReq, err := h.buildUpstreamRequest(r, base, endpoint, body)
 		if err != nil {
 			lastErr = err
 			continue
-		}
-		for k, vals := range r.Header {
-			for _, v := range vals {
-				upReq.Header.Add(k, v)
-			}
-		}
-		if upReq.Header.Get("Content-Type") == "" {
-			upReq.Header.Set("Content-Type", "application/json")
 		}
 
 		resp, err := h.httpClient.Do(upReq)
 		if err != nil {
 			lastErr = err
-			if n > 1 {
+			h.pool.Failure(base)
+			if !last {
+				h.metrics.Retries.WithLabelValues("transport").Inc()
 				h.logger.Warn("upstream failed, trying next",
-					"upstream", h.upstreams[(start+i)%n].String(), "error", err)
+					"upstream", base.String(), "error", err)
 			}
 			continue
 		}
+		h.metrics.UpstreamRequests.WithLabelValues(base.String(), strconv.Itoa(resp.StatusCode)).Inc()
+
+		if reason := h.retryReason(base, resp.StatusCode, model, r.Method); reason != "" && !last {
+			if reason == "status_5xx" {
+				h.pool.Failure(base)
+			}
+			h.metrics.Retries.WithLabelValues(reason).Inc()
+			h.logger.Warn("upstream response not usable, trying next",
+				"upstream", base.String(), "status", resp.StatusCode, "reason", reason)
+			drain(resp)
+			lastErr = fmt.Errorf("upstream %s: %s", base, resp.Status)
+			continue
+		}
+
+		h.pool.Success(base)
 		return resp, nil
 	}
 	return nil, lastErr
 }
 
-// serveNonStream reads the full upstream response, extracts tokens/text, writes
-// it back unchanged, and records the request.
+// buildUpstreamRequest clones the client request onto one upstream base URL.
+func (h *Handler) buildUpstreamRequest(r *http.Request, base *url.URL, endpoint string, body []byte) (*http.Request, error) {
+	up := *base
+	up.Path = strings.TrimRight(up.Path, "/") + endpoint
+	up.RawQuery = r.URL.RawQuery
+
+	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, up.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, vals := range r.Header {
+		for _, v := range vals {
+			upReq.Header.Add(k, v)
+		}
+	}
+	// The body may have been rewritten (or simply re-read); let net/http set the
+	// length rather than trusting the client's header.
+	upReq.Header.Del("Content-Length")
+	if upReq.Header.Get("Content-Type") == "" {
+		upReq.Header.Set("Content-Type", "application/json")
+	}
+	return upReq, nil
+}
+
+// retryReason names why a response should be retried on another upstream, or
+// returns "" to accept it. A 404 is only worth retrying when the pool knows the
+// model lives somewhere else — otherwise every upstream would answer the same.
+func (h *Handler) retryReason(base *url.URL, status int, model, method string) string {
+	if h.retryStatus && status >= http.StatusInternalServerError {
+		return "status_5xx"
+	}
+	if status == http.StatusNotFound && method == http.MethodPost &&
+		h.pool.ModelElsewhere(base, model) {
+		return "model_not_found"
+	}
+	return ""
+}
+
+// drain reads and closes a response being discarded on failover, so its
+// connection can be reused.
+func drain(resp *http.Response) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
+	_ = resp.Body.Close()
+}
+
+// injectStreamUsage sets stream_options.include_usage on an OpenAI-compatible
+// streaming request. Without it the upstream omits the usage object entirely and
+// the whole /v1 streaming surface records zero tokens. A body that is not a JSON
+// object is passed through untouched.
+func injectStreamUsage(body []byte) []byte {
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(body, &doc) != nil {
+		return body
+	}
+	if _, ok := doc["stream"]; !ok {
+		return body
+	}
+
+	opts := map[string]json.RawMessage{}
+	if raw, ok := doc["stream_options"]; ok {
+		if json.Unmarshal(raw, &opts) != nil {
+			return body // caller sent something we should not rewrite
+		}
+		if _, set := opts["include_usage"]; set {
+			return body // an explicit client choice wins
+		}
+	}
+	opts["include_usage"] = json.RawMessage("true")
+
+	encoded, err := json.Marshal(opts)
+	if err != nil {
+		return body
+	}
+	doc["stream_options"] = encoded
+
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// serveNonStream reads the full upstream response, stores it in the cache when
+// eligible, and hands it to completeNonStream.
 func (h *Handler) serveNonStream(w http.ResponseWriter, resp *http.Response, r *http.Request, rc reqCtx) {
 	respBuf, err := io.ReadAll(resp.Body)
 	errMsg := ""
@@ -400,6 +764,32 @@ func (h *Handler) serveNonStream(w http.ResponseWriter, resp *http.Response, r *
 		errMsg = "read response: " + err.Error()
 		h.logger.Error("reading non-stream response", "request_id", rc.reqID, "error", err)
 	}
+
+	if err == nil && rc.cacheKey != "" && cache.Cacheable(resp.StatusCode, resp.Header.Get("Content-Type")) {
+		h.cache.Put(rc.cacheKey, &cache.Entry{
+			Status: resp.StatusCode,
+			Header: resp.Header,
+			Body:   respBuf,
+		})
+	}
+
+	h.completeNonStream(w, r, rc, resp.StatusCode, respBuf, errMsg, false)
+}
+
+// completeNonStream writes a complete response body to the client (its headers
+// are already sent), extracts tokens and text from it, updates the metrics, and
+// records the request. It serves both a freshly proxied response and one replayed
+// from the cache.
+func (h *Handler) completeNonStream(
+	w http.ResponseWriter,
+	r *http.Request,
+	rc reqCtx,
+	status int,
+	respBuf []byte,
+	errMsg string,
+	cached bool,
+) {
+	_, _ = w.Write(respBuf)
 
 	var promptTokens, completionTokens int64
 	var respText string
@@ -419,26 +809,22 @@ func (h *Handler) serveNonStream(w http.ResponseWriter, resp *http.Response, r *
 		respText, promptTokens, completionTokens, hasTokens = parseNativeNonStream(respBuf)
 	}
 
-	if !hasTokens {
+	if !hasTokens && !cached {
 		h.logger.Warn("no token counts in non-stream response",
 			"request_id", rc.reqID, "endpoint", rc.endpoint, "model", rc.model,
 			"openai", rc.isOpenAI, "response_bytes", len(respBuf))
 	}
-	if promptTokens > 0 {
-		h.metrics.TokensIn.WithLabelValues(rc.endpoint, rc.model).Add(float64(promptTokens))
-	}
-	if completionTokens > 0 {
-		h.metrics.TokensOut.WithLabelValues(rc.endpoint, rc.model).Add(float64(completionTokens))
-	}
 
-	_, _ = w.Write(respBuf)
+	var estimated bool
+	promptTokens, completionTokens, estimated = h.applyTokens(
+		rc, hasTokens, cached, promptTokens, completionTokens, respText)
 
 	duration := time.Since(rc.start)
 	h.metrics.BytesOut.WithLabelValues(rc.endpoint, rc.model, rc.streamLabel).Add(float64(len(respBuf)))
-	h.metrics.ReqTotal.WithLabelValues(rc.endpoint, rc.model, strconv.Itoa(resp.StatusCode), rc.streamLabel).Inc()
+	h.metrics.ReqTotal.WithLabelValues(rc.endpoint, rc.model, strconv.Itoa(status), rc.streamLabel).Inc()
 	h.metrics.ReqDuration.WithLabelValues(rc.endpoint, rc.model, rc.streamLabel).Observe(duration.Seconds())
 
-	cost := h.cost(rc.model, promptTokens, completionTokens)
+	cost := h.cost(rc.model, promptTokens, completionTokens, cached)
 	h.persistAndLog(db.RequestRecord{
 		RequestID:        rc.reqID,
 		SessionID:        rc.sessionID,
@@ -447,7 +833,7 @@ func (h *Handler) serveNonStream(w http.ResponseWriter, resp *http.Response, r *
 		Method:           rc.method,
 		Model:            rc.model,
 		Stream:           false,
-		StatusCode:       resp.StatusCode,
+		StatusCode:       status,
 		DurationMS:       duration.Milliseconds(),
 		RequestBytes:     rc.reqBytes,
 		ResponseBytes:    int64(len(respBuf)),
@@ -460,7 +846,52 @@ func (h *Handler) serveNonStream(w http.ResponseWriter, resp *http.Response, r *
 		UserAgent:        r.UserAgent(),
 		PromptText:       rc.promptText,
 		ResponseText:     respText,
+		TokensEstimated:  estimated,
+		Cached:           cached,
 	})
+}
+
+// applyTokens books the token counters for one finished request and fills in an
+// estimate when the upstream reported nothing. A cache hit spent no tokens at
+// all, so its counts are booked as savings instead.
+func (h *Handler) applyTokens(
+	rc reqCtx,
+	hasTokens, cached bool,
+	promptTokens, completionTokens int64,
+	respText string,
+) (int64, int64, bool) {
+	if cached {
+		saved := promptTokens + completionTokens
+		if saved > 0 {
+			h.metrics.CacheSavedTokens.WithLabelValues(rc.endpoint, rc.model).Add(float64(saved))
+		}
+		return promptTokens, completionTokens, false
+	}
+
+	estimated := false
+	if !hasTokens && h.estimateTokens {
+		promptTokens = tokens.Estimate(rc.promptText)
+		completionTokens = tokens.Estimate(respText)
+		estimated = promptTokens > 0 || completionTokens > 0
+	}
+
+	if estimated {
+		if promptTokens > 0 {
+			h.metrics.EstimatedTokens.WithLabelValues(rc.endpoint, rc.model, "prompt").Add(float64(promptTokens))
+		}
+		if completionTokens > 0 {
+			h.metrics.EstimatedTokens.WithLabelValues(rc.endpoint, rc.model, "completion").Add(float64(completionTokens))
+		}
+		return promptTokens, completionTokens, true
+	}
+
+	if promptTokens > 0 {
+		h.metrics.TokensIn.WithLabelValues(rc.endpoint, rc.model).Add(float64(promptTokens))
+	}
+	if completionTokens > 0 {
+		h.metrics.TokensOut.WithLabelValues(rc.endpoint, rc.model).Add(float64(completionTokens))
+	}
+	return promptTokens, completionTokens, false
 }
 
 // serveStream relays the upstream response line-by-line (preserving both NDJSON
@@ -515,19 +946,18 @@ func (h *Handler) serveStream(w http.ResponseWriter, resp *http.Response, r *htt
 		ttft = firstTokenAt.Sub(rc.start)
 		h.metrics.TTFT.WithLabelValues(rc.endpoint, rc.model).Observe(ttft.Seconds())
 	}
-	if promptTokens > 0 {
-		h.metrics.TokensIn.WithLabelValues(rc.endpoint, rc.model).Add(float64(promptTokens))
-	}
-	if completionTokens > 0 {
-		h.metrics.TokensOut.WithLabelValues(rc.endpoint, rc.model).Add(float64(completionTokens))
-	}
+
+	respText := respBuilder.String()
+	hasTokens := promptTokens > 0 || completionTokens > 0
+	promptTokens, completionTokens, estimated := h.applyTokens(
+		rc, hasTokens, false, promptTokens, completionTokens, respText)
 
 	duration := time.Since(rc.start)
 	h.metrics.BytesOut.WithLabelValues(rc.endpoint, rc.model, rc.streamLabel).Add(float64(totalBytes))
 	h.metrics.ReqTotal.WithLabelValues(rc.endpoint, rc.model, strconv.Itoa(resp.StatusCode), rc.streamLabel).Inc()
 	h.metrics.ReqDuration.WithLabelValues(rc.endpoint, rc.model, rc.streamLabel).Observe(duration.Seconds())
 
-	cost := h.cost(rc.model, promptTokens, completionTokens)
+	cost := h.cost(rc.model, promptTokens, completionTokens, false)
 	h.persistAndLog(db.RequestRecord{
 		RequestID:        rc.reqID,
 		SessionID:        rc.sessionID,
@@ -549,7 +979,8 @@ func (h *Handler) serveStream(w http.ResponseWriter, resp *http.Response, r *htt
 		ClientIP:         rc.clientIP,
 		UserAgent:        r.UserAgent(),
 		PromptText:       rc.promptText,
-		ResponseText:     respBuilder.String(),
+		ResponseText:     respText,
+		TokensEstimated:  estimated,
 	})
 }
 
@@ -629,10 +1060,12 @@ func parseStreamLine(isOpenAI bool, line []byte) (text string, promptTokens, com
 }
 
 // cost returns the estimated cost for the given model/token counts, or 0 when no
-// pricing table is configured.
-func (h *Handler) cost(model string, promptTokens, completionTokens int64) float64 {
+// pricing table is configured. A cache hit still carries the cost the client
+// would have paid — the row is what the client consumed — but it is not added to
+// the spend counter, which tracks money actually burned upstream.
+func (h *Handler) cost(model string, promptTokens, completionTokens int64, cached bool) float64 {
 	c := h.prices.Cost(model, promptTokens, completionTokens)
-	if c > 0 {
+	if c > 0 && !cached {
 		h.metrics.CostTotal.WithLabelValues(model).Add(c)
 	}
 	return c
@@ -669,6 +1102,11 @@ func (h *Handler) persistAndLog(rec db.RequestRecord) {
 			"request_id", rec.RequestID, "error", err)
 	}
 
+	// A cache hit cost nothing upstream, so it is not charged to the budget.
+	if !rec.Cached {
+		h.budgets.Add(rec.SessionID, rec.TotalTokens, rec.Cost)
+	}
+
 	h.logger.Info("request",
 		"request_id", rec.RequestID,
 		"session_id", rec.SessionID,
@@ -685,6 +1123,8 @@ func (h *Handler) persistAndLog(rec db.RequestRecord) {
 		"completion_tokens", rec.CompletionTokens,
 		"total_tokens", rec.TotalTokens,
 		"cost", rec.Cost,
+		"tokens_estimated", rec.TokensEstimated,
+		"cached", rec.Cached,
 		"client_ip", rec.ClientIP,
 		"user_agent", rec.UserAgent,
 		"error", rec.ErrorMessage,
@@ -720,6 +1160,8 @@ func (h *Handler) publishEvent(rec db.RequestRecord) {
 		UserAgent:        rec.UserAgent,
 		PromptText:       rec.PromptText,
 		ResponseText:     rec.ResponseText,
+		TokensEstimated:  rec.TokensEstimated,
+		Cached:           rec.Cached,
 	}
 	if b, err := json.Marshal(row); err == nil {
 		h.events.Publish(b)
@@ -743,7 +1185,7 @@ func (h *Handler) recordError(
 		Timestamp:     start,
 		Endpoint:      endpoint,
 		Method:        r.Method,
-		Model:         "unknown",
+		Model:         modelname.Unknown,
 		Stream:        false,
 		StatusCode:    statusCode,
 		DurationMS:    duration.Milliseconds(),

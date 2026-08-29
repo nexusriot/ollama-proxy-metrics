@@ -57,3 +57,38 @@ func TestLoad_FromFile(t *testing.T) {
 		t.Errorf("cost = %v, want 9", got)
 	}
 }
+
+func TestCost_FallsBackToTheUntaggedRate(t *testing.T) {
+	table := &Table{
+		Currency: "USD",
+		Models:   map[string]ModelRate{"llama3": {PromptPer1K: 1, CompletionPer1K: 2}},
+	}
+	// Normalization records "llama3:latest"; the table still prices it.
+	if got := table.Cost("llama3:latest", 1000, 1000); got != 3 {
+		t.Fatalf("Cost(llama3:latest) = %v, want 3", got)
+	}
+}
+
+func TestCost_ExactTagBeatsTheUntaggedRate(t *testing.T) {
+	table := &Table{
+		Currency: "USD",
+		Models: map[string]ModelRate{
+			"llama3":     {PromptPer1K: 1, CompletionPer1K: 1},
+			"llama3:70b": {PromptPer1K: 10, CompletionPer1K: 10},
+		},
+	}
+	if got := table.Cost("llama3:70b", 1000, 0); got != 10 {
+		t.Fatalf("Cost(llama3:70b) = %v, want the exact rate 10", got)
+	}
+}
+
+func TestCost_RegistryPortIsNotATag(t *testing.T) {
+	table := &Table{
+		Currency: "USD",
+		Models:   map[string]ModelRate{"registry:5000": {PromptPer1K: 99}},
+	}
+	// "registry:5000/ns/model" must not be priced as the host "registry:5000".
+	if got := table.Cost("registry:5000/ns/model", 1000, 0); got != 0 {
+		t.Fatalf("Cost(registry path) = %v, want 0", got)
+	}
+}

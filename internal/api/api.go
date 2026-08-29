@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/nexusriot/ollama-proxy-metrics/internal/budget"
 	"github.com/nexusriot/ollama-proxy-metrics/internal/db"
 	"github.com/nexusriot/ollama-proxy-metrics/internal/events"
 	"github.com/nexusriot/ollama-proxy-metrics/internal/pricing"
@@ -20,18 +21,33 @@ const exportMaxRows = 100_000
 
 // Handler exposes the admin REST API over a given http.ServeMux prefix.
 type Handler struct {
-	store  *db.Store
-	prices *pricing.Table
-	events *events.Broker
+	store   *db.Store
+	prices  *pricing.Table
+	events  *events.Broker
+	budgets *budget.Tracker
 }
 
-// New creates a new API Handler backed by store. prices and broker may be nil
-// (the pricing endpoint reports an empty table; the stream endpoint reports 503).
-func New(store *db.Store, prices *pricing.Table, broker *events.Broker) *Handler {
-	if prices == nil {
-		prices = pricing.Empty()
+// Options configures an API Handler. Only Store is required; a nil Prices
+// reports an empty table, a nil Events makes the stream endpoint report 503, and
+// a nil Budgets reports no ceilings.
+type Options struct {
+	Store   *db.Store
+	Prices  *pricing.Table
+	Events  *events.Broker
+	Budgets *budget.Tracker
+}
+
+// New creates a new API Handler from opts.
+func New(opts Options) *Handler {
+	if opts.Prices == nil {
+		opts.Prices = pricing.Empty()
 	}
-	return &Handler{store: store, prices: prices, events: broker}
+	return &Handler{
+		store:   opts.Store,
+		prices:  opts.Prices,
+		events:  opts.Events,
+		budgets: opts.Budgets,
+	}
 }
 
 // Register mounts all API routes under mux at the given prefix (e.g. "/admin/api").
@@ -42,6 +58,8 @@ func (h *Handler) Register(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc(prefix+"/sessions", corsMiddleware(h.handleSessions))
 	mux.HandleFunc(prefix+"/models", corsMiddleware(h.handleModels))
 	mux.HandleFunc(prefix+"/model-stats", corsMiddleware(h.handleModelStats))
+	mux.HandleFunc(prefix+"/status-counts", corsMiddleware(h.handleStatusCounts))
+	mux.HandleFunc(prefix+"/budgets", corsMiddleware(h.handleBudgets))
 	mux.HandleFunc(prefix+"/pricing", corsMiddleware(h.handlePricing))
 	mux.HandleFunc(prefix+"/export", corsMiddleware(h.handleExport))
 	mux.HandleFunc(prefix+"/cleanup", corsMiddleware(h.handleCleanup))
@@ -196,6 +214,51 @@ func (h *Handler) handleModelStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
+// handleStatusCounts reports the status-code distribution for the current
+// filters. The status and errors-only selections are deliberately dropped from
+// the filter: a facet has to keep showing the codes you are not looking at.
+func (h *Handler) handleStatusCounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	f := requestFilter(r.URL.Query())
+	f.Status = 0
+	f.ErrorsOnly = false
+
+	counts, err := h.store.StatusCounts(f)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if counts == nil {
+		counts = []db.StatusCount{}
+	}
+	writeJSON(w, http.StatusOK, counts)
+}
+
+// budgetsResponse reports the configured ceilings alongside today's usage.
+type budgetsResponse struct {
+	Enabled bool                    `json:"enabled"`
+	Day     string                  `json:"day"`
+	Limits  budget.Limits           `json:"limits"`
+	Usage   map[string]budget.Usage `json:"usage"`
+}
+
+func (h *Handler) handleBudgets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	day, usage := h.budgets.Snapshot()
+	writeJSON(w, http.StatusOK, budgetsResponse{
+		Enabled: h.budgets.Enabled(),
+		Day:     day,
+		Limits:  h.budgets.Limits(),
+		Usage:   usage,
+	})
+}
+
 func (h *Handler) handlePricing(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
@@ -246,7 +309,7 @@ func (h *Handler) handleExport(w http.ResponseWriter, r *http.Request) {
 		"request_id", "session_id", "timestamp", "endpoint", "method", "model",
 		"stream", "status_code", "duration_ms", "ttft_ms", "request_bytes",
 		"response_bytes", "prompt_tokens", "completion_tokens", "total_tokens",
-		"cost", "error_message", "client_ip", "user_agent",
+		"cost", "tokens_estimated", "cached", "error_message", "client_ip", "user_agent",
 	})
 	for _, r := range rows {
 		_ = cw.Write([]string{
@@ -256,7 +319,9 @@ func (h *Handler) handleExport(w http.ResponseWriter, r *http.Request) {
 			strconv.FormatInt(r.TTFTMs, 10), strconv.FormatInt(r.RequestBytes, 10),
 			strconv.FormatInt(r.ResponseBytes, 10), strconv.FormatInt(r.PromptTokens, 10),
 			strconv.FormatInt(r.CompletionTokens, 10), strconv.FormatInt(r.TotalTokens, 10),
-			strconv.FormatFloat(r.Cost, 'f', -1, 64), r.ErrorMessage, r.ClientIP, r.UserAgent,
+			strconv.FormatFloat(r.Cost, 'f', -1, 64),
+			strconv.FormatBool(r.TokensEstimated), strconv.FormatBool(r.Cached),
+			r.ErrorMessage, r.ClientIP, r.UserAgent,
 		})
 	}
 }
@@ -310,15 +375,28 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // requestFilter builds a db.RequestFilter from the query parameters shared by
-// the requests and export endpoints (model, session, q, since, until).
+// the requests and export endpoints (model, session, q, since, until, status,
+// errors).
 func requestFilter(q url.Values) db.RequestFilter {
 	return db.RequestFilter{
-		Model:   q.Get("model"),
-		Session: q.Get("session"),
-		Query:   q.Get("q"),
-		Since:   q.Get("since"),
-		Until:   q.Get("until"),
+		Model:      q.Get("model"),
+		Session:    q.Get("session"),
+		Query:      q.Get("q"),
+		Since:      q.Get("since"),
+		Until:      q.Get("until"),
+		Status:     queryInt(q.Get("status"), 0),
+		ErrorsOnly: queryBool(q.Get("errors")),
 	}
+}
+
+// queryBool reads a boolean query parameter, treating anything unparseable as
+// false so a malformed filter widens the result set rather than hiding rows.
+func queryBool(s string) bool {
+	if s == "" {
+		return false
+	}
+	v, err := strconv.ParseBool(s)
+	return err == nil && v
 }
 
 func queryInt(s string, def int) int {

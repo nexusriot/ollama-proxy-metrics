@@ -31,10 +31,15 @@ streaming semantics, headers, and status codes.
 
 ### Non-goals
 
-- **Not** an auth gateway, rate limiter, or quota enforcer (see §12).
-- **Not** a load balancer — exactly one upstream per process.
-- **Not** a tokenizer — if Ollama omits counts, they are recorded as `0`.
+- **Not** an auth gateway (see §12).
 - **Not** a long-term metrics store — Prometheus/Grafana own retention.
+- **Not** a tokenizer. Counts come from the model; the optional estimator (§3) is
+  a labelled fallback, never presented as exact.
+
+Two former non-goals have since been taken on deliberately: the proxy now
+**routes across several upstreams** by model and health, and it **enforces
+quotas** (per-minute rate limits and daily token/cost budgets). Both live in
+front of the upstream because that is the only place that sees every client.
 
 ---
 
@@ -58,14 +63,20 @@ One binary, a handful of small single-responsibility packages:
 
 | Package            | Responsibility                                                        |
 |--------------------|-----------------------------------------------------------------------|
-| `cmd/…/main.go`    | Flag/env parsing, logger, DB open, pricing load, broker/limiter, mux wiring, `ListenAndServe`, `/healthz` + `/readyz`. |
-| `internal/proxy`   | The reverse-proxy `http.Handler` for `/api/*` and `/v1/*`; Prometheus metrics; request/response parsing (native + OpenAI); token/TTFT extraction; round-robin + failover; cost stamping; event publish. |
+| `cmd/…/main.go`    | Flag/env parsing, logger, DB open, pricing load, subsystem construction, mux wiring, listener + graceful `serve`, `/healthz` + `/readyz`. |
+| `internal/proxy`   | The reverse-proxy `http.Handler` for `/api/*` and `/v1/*`; Prometheus metrics; request/response parsing (native + OpenAI); token/TTFT extraction; routing + retry; cache/gate/budget integration; cost stamping; event publish. |
 | `internal/db`      | SQLite schema, migrations, insert, and all read queries (summary/daily/sessions/requests/model-stats/export/cleanup). |
 | `internal/api`     | Read/admin REST handlers over `db.Store`, CORS, JSON encoding, CSV/JSON export, SSE stream. |
 | `internal/pricing` | Per-model `$/1K-token` table + `Cost()` calculation; loaded from JSON. |
 | `internal/events`  | In-process fan-out broker backing the live (SSE) tail; non-blocking, drop-on-slow. |
 | `internal/ratelimit` | Per-session fixed-window request limiter (dependency-free). |
 | `internal/logging` | Size-based rotating log writer (dependency-free).                     |
+| `internal/upstream` | Upstream pool: model-inventory polling, per-request candidate ordering, circuit breaker. |
+| `internal/gate`    | Concurrency semaphore with a bounded wait queue.                      |
+| `internal/cache`   | TTL + size-bounded LRU for non-streaming responses.                   |
+| `internal/budget`  | Per-session daily token/cost accounting, seeded from SQLite.          |
+| `internal/modelname` | Model-name normalization and alias folding.                         |
+| `internal/tokens`  | Rough token estimate used when the upstream reports none.             |
 
 The HTTP surface is a single `http.ServeMux`:
 
@@ -97,9 +108,20 @@ Every `/api/*` and `/v1/*` request flows through `Handler.ServeHTTP`:
 2. **Rate limit (optional).** If enabled, `ratelimit.Limiter.Allow(session_id)`
    gates the request; over-limit requests get `429` + `Retry-After`, are recorded
    as errors, and bump `ollama_proxy_rate_limited_total`.
-3. **Buffer the request body** so it can be (a) JSON-parsed for
-   `model`/`prompt`/`stream` and (b) replayed to the upstream (and to a second
-   upstream on failover). Bounds per-request memory by request size.
+2a. **Budget (optional).** `budget.Tracker.Check(session_id)` compares the
+   session's day-to-date tokens and cost against the configured ceilings. This
+   runs *before* the body is read: an exhausted session should not get to spend
+   memory either. Refusals are `429` with `Retry-After` set to the seconds left
+   until midnight UTC.
+3. **Buffer the request body**, wrapped in `http.MaxBytesReader` when
+   `MAX_BODY_MB` is set, so it can be (a) JSON-parsed for `model`/`prompt`/`stream`
+   and (b) replayed to the upstream (and to a second upstream on failover). The
+   cap is what actually bounds per-request memory — buffering is unavoidable, so
+   the size limit is the only defence against one oversized POST. Over-limit
+   bodies get `413`.
+3a. **Resolve the model name.** `modelname.Normalize` applies the alias map and
+   the implicit `:latest` tag, so one model is one series. The *forwarded* body is
+   never rewritten — aliases group statistics, they do not redirect requests.
 4. **Best-effort parse** into a minimal `requestPayload` (`model`, `stream`,
    `prompt`, `messages`, `input`) — shapes that overlap between native and OpenAI.
    Parse failure is ignored; the request is still proxied.
@@ -107,10 +129,27 @@ Every `/api/*` and `/v1/*` request flows through `Handler.ServeHTTP`:
    `true`**; OpenAI (`/v1/*`) **defaults to `false`** (matching the OpenAI API);
    embeddings never stream; any non-`POST` (e.g. `GET /api/tags`, `GET /v1/models`)
    is non-stream.
-6. **Forward with failover** (`forward`): round-robin across the configured
-   upstreams via an atomic cursor; on a transport error, try the next upstream.
-   The shared `http.Client` has **`Timeout: 0`** (a fixed timeout would kill long
-   generations / open streams).
+5a. **Cache lookup** (non-streaming POSTs only, when `CACHE_TTL` is set), keyed
+   on endpoint + method + exact body. A hit is replayed straight to the client
+   with `X-Proxy-Cache: hit` and recorded with `cached=1`. The lookup happens
+   *before* the concurrency gate on purpose: a hit costs no upstream work, so it
+   has no business queueing behind requests that do.
+5b. **Concurrency gate** (POSTs only, when `MAX_CONCURRENT` is set). Waiting time
+   is observed into `ollama_proxy_queue_wait_seconds`; a full queue answers `503`
+   + `Retry-After`; a client that disconnects while queued is recorded as `499`
+   with nothing written.
+5c. **Usage injection.** For OpenAI-compatible *streaming* requests,
+   `stream_options.include_usage` is set unless the client chose explicitly —
+   without it the upstream omits `usage` and the whole `/v1` streaming surface
+   records zero tokens.
+6. **Forward with routing and retry** (`forward`): `upstream.Pool.Pick(model)`
+   returns *every* upstream, ordered — those known to serve the model first, then
+   unknown inventories, then the rest, with an open circuit sinking one to the
+   bottom. Candidates are tried in order on a transport error, on a 5xx (when
+   `RETRY_5XX`), and on a 404 when the inventory says another node serves that
+   model. Because the response headers are not written until `forward` returns, a
+   retry is invisible to the client. The shared `http.Client` has **`Timeout: 0`**
+   (a fixed timeout would kill long generations / open streams).
 7. **Relay the response**, in one of two modes, format-aware (native vs OpenAI):
 
    - **Non-streaming** — read the whole body; for native, parse the single JSON
@@ -123,9 +162,11 @@ Every `/api/*` and `/v1/*` request flows through `Handler.ServeHTTP`:
      non-empty chunk, and reads token counts from the final chunk (`done:true`
      for native; the `usage` object for OpenAI, when present).
 
-8. **Record once.** Compute `cost` from the pricing table, increment Prometheus
-   counters, build a `db.RequestRecord`, and call `persistAndLog` — one SQLite
-   insert, one JSON log line, and one publish to live (SSE) subscribers.
+8. **Record once.** Fill in estimated token counts if the upstream reported none
+   and `ESTIMATE_TOKENS` is on, compute `cost` from the pricing table, increment
+   Prometheus counters, build a `db.RequestRecord`, and call `persistAndLog` —
+   one SQLite insert, one JSON log line, one budget charge, and one publish to
+   live (SSE) subscribers.
 
 Early failures (body read error, all upstreams unreachable, rate limit) short-circuit
 through `recordError`, which still persists a row, logs, and publishes — so failed
@@ -136,7 +177,13 @@ requests are counted, not silently dropped.
 Tokens are **authoritative from Ollama**, taken from the final chunk's
 `prompt_eval_count` (→ prompt/input tokens) and `eval_count` (→ completion
 tokens). `total = prompt + completion`. If a `done` response carries neither
-count, a warning is logged and the row stores `0`. This is why embeddings needed
+count, a warning is logged and the row stores `0` — unless `ESTIMATE_TOKENS` is
+on, in which case `tokens.Estimate` fills in a ~4-chars-per-token guess from the
+captured text and the row is flagged `tokens_estimated`. The flag is the whole
+point: an estimate that cannot be told apart from a measurement is worse than no
+estimate, so estimated counts are also kept out of `prompt_tokens_total` /
+`completion_tokens_total` and reported under
+`ollama_proxy_estimated_tokens_total` instead. This is why embeddings needed
 a dedicated fix (they report `prompt_eval_count` only) and why the NDJSON
 fallback exists.
 
@@ -166,6 +213,11 @@ Design choices:
   best-effort `ALTER TABLE … ADD COLUMN` (duplicate-column errors ignored). This
   is how `ttft_ms`, `cost`, `prompt_text`, and `response_text` were added without
   a migration tool.
+- **`tokens_estimated` and `cached` are stored per row**, so every aggregate can
+  be read two ways: as what clients consumed, or as what the GPU actually did.
+  A cache hit records the tokens and cost the client would have paid (its row
+  reads like any other) but is charged to neither `cost_total` nor the session
+  budget, because nothing was generated.
 - **Cost is stored on the row, computed once at write time** (a `cost REAL`
   column) rather than derived at read time. This keeps every aggregate a trivial
   `SUM(cost)` — no need to join a pricing table or group by model inside each
@@ -185,6 +237,9 @@ Design choices:
 | `ListRequests`   | `/requests`         | Paginated rows + total count; optional `model`/`session` filters (parameterized). |
 | `ExportRequests` | `/export`           | Same filters, no pagination, capped at 100k rows. |
 | `Models`         | `/models`           | `DISTINCT model`.                                 |
+| `StatusCounts`   | `/status-counts`    | Status-code distribution for the current filters, commonest first. |
+| `UsageSince`     | — (startup)         | Per-session tokens/cost since a timestamp; seeds the budget tracker. |
+| `RenameModel`    | — (startup)         | Rewrites one model name; backs the normalization backfill. |
 | `DeleteAll`      | `/cleanup` (POST)   | `DELETE FROM requests` + `VACUUM`.                |
 
 All user-supplied filters are passed as **bound parameters**, never string-concatenated.
@@ -215,7 +270,19 @@ ollama_proxy_request_bytes_in_total / _out_total{endpoint,model,stream}
 ollama_proxy_prompt_tokens_total / completion_tokens_total{endpoint,model}
 ollama_proxy_cost_total{model}                                      # only when priced > 0
 ollama_proxy_rate_limited_total                                     # no labels
+ollama_proxy_estimated_tokens_total{endpoint,model,kind}
+ollama_proxy_budget_denied_total{reason}
+ollama_proxy_inflight_requests
+ollama_proxy_queue_wait_seconds / ollama_proxy_queue_rejected_total
+ollama_proxy_cache_hits_total / _misses_total / _saved_tokens_total{endpoint,model}
+ollama_proxy_cache_entries / ollama_proxy_cache_bytes                # gauge funcs
+ollama_proxy_upstream_up{upstream}
+ollama_proxy_upstream_requests_total{upstream,status}
+ollama_proxy_upstream_retries_total{reason}
 ```
+
+The `upstream` label is bounded by the configured backend list, and `reason` /
+`kind` by small enums, so cardinality stays flat.
 
 `endpoint`, `model`, `status`, and `stream` are all low-cardinality. Crucially,
 **`session_id` and `client_ip` are never used as labels** — they are unbounded
@@ -255,13 +322,14 @@ Vite + React + TypeScript + Recharts, no router and no state library:
   the pricing table once (for the currency symbol) and owns the live-tail state.
 - `components/` — presentational: `SummaryCards`, `DailyChart` (toggle
   tokens/requests/duration/**cost** × 7/14/30/90-day window), `RequestsTable`
-  (paginated; filter by model/session/**free-text search**/**date range**;
+  (paginated; filter by model/session/**free-text search**/**date range**/**errors
+  only**/**status chip**;
   expandable rows with prompt/response + **copy** buttons + TTFT/throughput/cost;
   **Live** and **CSV** controls), `ModelsTable` (per-model table + throughput bar
   chart), `SessionsTable` (click-through pre-filters the Requests tab).
 
 Data flow is **pull, on demand**: load on mount, re-fetch when
-filters/search/dates/page/window change (each filter change resets to page 1),
+filters/search/dates/status/page/window change (each filter change resets to page 1),
 and a manual refresh button — *except* the live tail, which is **push**: toggling
 **Live** opens an `EventSource` to `/admin/api/stream` and prepends rows as they
 arrive (capped at 200, pagination suspended, still honoring the model/session/search
@@ -333,6 +401,19 @@ Everything is a flag with an env fallback (flag wins if set), resolved in
 | `-rate-limit`  | `RATE_LIMIT_RPM`  | `0`                       | Per-session requests/min; 0 disables. |
 | `-log-max-mb`  | `LOG_MAX_MB`      | `50`                      | Rotate past this size; 0 disables rotation. |
 | `-log-backups` | `LOG_MAX_BACKUPS` | `5`                       | Rotated files retained.        |
+| `-max-body-mb` | `MAX_BODY_MB`     | `32`                      | Body cap; 0 disables.          |
+| `-max-concurrent` / `-max-queue` | `MAX_CONCURRENT` / `MAX_QUEUE` | `0` / `0` | Concurrency slots and queue depth. |
+| `-cache-ttl` / `-cache-max-mb` | `CACHE_TTL` / `CACHE_MAX_MB` | `0` / `64` | Response cache; a zero TTL disables it. |
+| `-budget-tokens` / `-budget-cost` | `BUDGET_TOKENS_PER_DAY` / `BUDGET_COST_PER_DAY` | `0` / `0` | Per-session daily ceilings. |
+| `-normalize-models` | `NORMALIZE_MODELS` | `true`               | Record `llama3` as `llama3:latest`. |
+| `-model-aliases` | `MODEL_ALIASES`  | `` (none)                 | `alias=target,…`.              |
+| `-normalize-backfill` | `NORMALIZE_BACKFILL` | `false`         | One-shot rewrite of historical rows. |
+| `-inject-usage` | `INJECT_USAGE`   | `true`                    | Set `stream_options.include_usage` on `/v1` streams. |
+| `-estimate-tokens` | `ESTIMATE_TOKENS` | `false`                | Estimate tokens when none are reported. |
+| `-retry-5xx`   | `RETRY_5XX`       | `true`                    | Retry a 5xx on the next upstream. |
+| `-upstream-poll` | `UPSTREAM_POLL` | `30s`                     | Inventory poll; 0 disables routing. |
+| `-circuit-failures` / `-circuit-cooldown` | `CIRCUIT_FAILURES` / `CIRCUIT_COOLDOWN` | `3` / `30s` | Circuit-breaker trip and recovery. |
+| `-shutdown-grace` | `SHUTDOWN_GRACE` | `30s`                   | Time in-flight requests get on SIGTERM. |
 
 ---
 
@@ -345,7 +426,8 @@ Current posture and the reasoning behind it:
 
 - **No authentication anywhere.** Both the Ollama proxy (`/api/*`) and the admin
   API (`/admin/api/*`) are open. `/admin/api/cleanup` can wipe all data with a
-  single unauthenticated `POST`.
+  single unauthenticated `POST`, and `/admin/api/budgets` discloses per-session
+  usage.
 - **CORS is `*`** on the admin API to make local dev frictionless.
 - **Full prompt & response text is stored in plaintext** in SQLite
   (`prompt_text` / `response_text`) and is returned by `/admin/api/requests`.
@@ -382,6 +464,23 @@ making prompt/response capture opt-out or length-capped (see §12, Tier 1).
 - **Log rotation** — `internal/logging` size-based rotation (`LOG_MAX_MB`/`LOG_MAX_BACKUPS`).
 - **`/healthz` + `/readyz`** — readiness pings an upstream's `/api/version`.
 
+### Implemented — Tier 4 (capacity, correctness & spend control)
+
+- **Graceful shutdown** — `signal.NotifyContext` + `http.Server.Shutdown` behind a
+  `run() error` so every deferred close actually runs. Previously a `SIGTERM` cut
+  open streams mid-generation and skipped the DB close and log flush entirely.
+- **Request body cap** — `http.MaxBytesReader` + `MAX_BODY_MB`, answering `413`.
+  §9 claimed memory was bounded by request size; until this there was no bound.
+- **Model-aware routing, retry and circuit breaking** — `internal/upstream`.
+- **Concurrency gate** — `internal/gate`, bounded queue, `503` when full.
+- **Response cache** — `internal/cache`, non-streaming only, `X-Proxy-Cache`.
+- **Daily token/cost budgets** — `internal/budget`, seeded from SQLite at startup.
+- **Model normalization + aliases** — `internal/modelname`, with an opt-in backfill.
+- **Usage injection & token estimation** — `stream_options.include_usage` for `/v1`
+  streams; a flagged estimate when the upstream still reports nothing.
+- **Error-focused dashboard view** — errors-only filter plus a status-code facet
+  (`/admin/api/status-counts`), shared by the list, the live tail and the export.
+
 ### Still open — Tier 1 (safety & correctness gaps)
 
 These remain the highest-value next steps and are deliberately **not** implemented:
@@ -393,8 +492,6 @@ These remain the highest-value next steps and are deliberately **not** implement
   a max-length cap, and/or redaction patterns.
 - **Data retention / auto-pruning** — delete rows older than N days (today
   `cleanup` is all-or-nothing); a `DELETE … WHERE timestamp <` job.
-- **Graceful shutdown** — `http.Server` + signal handling so in-flight requests
-  and the final DB write/log flush complete on `SIGTERM`.
 
 ### Known limitations of the new features
 
@@ -406,8 +503,20 @@ These remain the highest-value next steps and are deliberately **not** implement
   window edges.
 - **Cost is frozen at request time**; changing the pricing table does not reprice
   historical rows (a deliberate trade for trivial SQL aggregation — see §4).
-- **Multi-upstream failover** retries only on *transport* errors before the
-  response is received; an upstream that returns a 5xx is not retried.
+- **Retries** cover transport errors, 5xx, and model-not-found 404s, all before
+  any response byte reaches the client. A failure *after* the stream has started
+  is still terminal — the client already has half an answer.
+- **Routing is only as fresh as the last inventory poll.** A model pulled or
+  deleted mid-interval is routed on stale information; the 404 retry is the
+  safety net, and ordering never excludes an upstream outright.
+- **The concurrency gate and the rate limiter are per-instance.** Like the
+  limiter, budgets live in memory — seeded from SQLite at startup, but not shared
+  across replicas.
+- **Budgets allow one overshooting request.** Usage is only known once a request
+  finishes, so the request that crosses the line completes and the next is refused.
+- **The response cache keys on the exact request body.** A semantically identical
+  request with reordered JSON keys is a miss, by design — parsing and canonicalizing
+  every body would cost more than the cache saves.
 
 ---
 
@@ -429,13 +538,26 @@ Go tests per package, all CGO-free and hermetic (every store opens `:memory:`):
   the SSE stream (both the 503-without-broker path and live delivery against a real
   `httptest.Server`).
 - `internal/pricing`, `internal/ratelimit`, `internal/events`, `internal/logging`
-  — unit tests for cost math/loading, window/limit/nil-safety, non-blocking
-  fan-out, and size-triggered rotation.
+  — unit tests for cost math/loading (including the untagged-rate fallback that
+  keeps existing pricing files working under normalization), window/limit/nil-safety,
+  non-blocking fan-out, and size-triggered rotation.
+- `internal/upstream`, `internal/gate`, `internal/cache`, `internal/budget`,
+  `internal/modelname`, `internal/tokens` — the new subsystems in isolation:
+  candidate ordering and inventory polling against `httptest` upstreams, circuit
+  trip/expiry on a fake clock, queue-full and double-release safety, LRU eviction
+  and TTL expiry on a fake clock, day rollover and seeding, tag/alias handling.
+- `internal/proxy` (`features_test.go`) — each new behaviour end-to-end through
+  `ServeHTTP`: the `413` cap, normalization and aliases, usage injection,
+  estimation on and off, cache hit/miss/never-for-streams, gate serialization and
+  `503`, budget refusal and accrual, and 5xx / model-not-found retries.
+- `cmd/ollama-proxy-metrics` — `serve` finishes an in-flight request after the
+  context is cancelled, stops accepting afterwards, and surfaces an expired grace
+  period; plus budget seeding, the normalization backfill and the env helpers.
 
 The whole suite passes under the race detector (`go test -race ./...`).
 
 Remaining gap: the NDJSON-when-`stream:false` native fallback and the OpenAI
-embeddings path still lack dedicated cases.
+embeddings path still lack dedicated cases, and the frontend has no tests at all.
 
 ```bash
 go test -race ./...    # all green; see README for per-package invocations
